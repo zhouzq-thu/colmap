@@ -92,10 +92,25 @@ void PreintegratedImuMeasurement::integrate(const Eigen::Vector3d& acc_true,
   // [A] Forster et al. "On-Manifold Preintegration for Real-Time
   // Visual-Inertial Odometry", TRO 16. Integration step translation: Eq. (37)
   // from [A]
+  /// \f{equation}{
+  ///   \Delta \tilde{\boldsymbol{p}}_{ij} = \sum_{k=i}^{j-1} \left[
+  ///     \Delta \tilde{\boldsymbol{v}}_{ik} \Delta t
+  ///   + \frac{1}{2} \Delta \tilde{\mathbf{R}}_{ik}
+  ///   \left( \tilde{\boldsymbol{a}}_{k} - \boldsymbol{b}^{a}_{k} \right) \Delta t^2 \right]
+  /// \f}
   delta_p_ij_ += delta_v_ij_ * dt + delta_R_ij_ * acc_true * 0.5 * dt * dt;
   // velocity: Eq. (36) from [A]
+  /// \f{equation}{
+  ///   \Delta \tilde{\boldsymbol{v}}_{ij} = \sum_{k=i}^{j-1}
+  ///   \Delta \tilde{\mathbf{R}}_{ik}
+  ///   \left( \tilde{\boldsymbol{a}}_{k} - \boldsymbol{b}^{a}_{k} \right) \Delta t
+  /// \f}
   delta_v_ij_ += delta_R_ij_ * acc_true * dt;
   // rotation: Eq. (35) from [A].
+  /// \f{equation}{
+  ///   \Delta \tilde{\mathbf{R}}_{ij} \triangleq \prod_{k=i}^{j-1} \mathrm{Exp} \left( 
+  ///   \left( \tilde{\boldsymbol{\omega}}_{k} - \boldsymbol{b}^{g}_{k} \right) \Delta t
+  /// \right) \f}
   Eigen::Quaterniond dq = QuaternionFromAngleAxis(gyro_true * dt);
   Eigen::Matrix3d Rs = delta_R_ij_.toRotationMatrix();
   delta_R_ij_ = delta_R_ij_ * dq;
@@ -107,7 +122,13 @@ void PreintegratedImuMeasurement::integrate(const Eigen::Vector3d& acc_true,
   // equation number, we refer it as Eq. (69 1/2) in the following.
   Eigen::Matrix3d Jr = RightJacobianFromAngleAxis(gyro_true * dt);
   Eigen::Matrix3d skew_acc = CrossProductMatrix(acc_true);
-
+  
+  /// \f{equation}{
+  /// \frac {\partial [\delta \boldsymbol{\phi}_{ij}^\top, \delta \boldsymbol{p}_{ij}^\top,
+  ///                  \delta \boldsymbol{v}_{ij}^\top]^\top}
+  ///       {\partial [\delta \boldsymbol{\phi}_{ij-1}^\top, \delta \boldsymbol{p}_{ij-1}^\top,
+  ///                  \delta \boldsymbol{v}_{ij-1}^\top, \boldsymbol{b}^a, \boldsymbol{b}^g]^\top}
+  /// \f}
   // Covariance propagation
   // Eq. (63) from [A]
   // Step 1: jacobian-based propagation
@@ -125,6 +146,16 @@ void PreintegratedImuMeasurement::integrate(const Eigen::Vector3d& acc_true,
   // fill in the bias-related jacobians
   // inversely update t, v, R due to the dependencies.
   // translation: Eq. (69 1/2) from [A]
+  /// \f{align}{
+  ///   \frac{\partial \Delta \bar{\boldsymbol{p}}_{ij}}{\partial \boldsymbol{b}^a}
+  ///   &= \sum_{k=i}^{j-1} \frac{\partial \Delta \bar{\boldsymbol{v}}_{ik}}{\partial \boldsymbol{b}^a} \Delta t
+  ///      - \frac{1}{2} \Delta \bar{\mathbf{R}}_{ik} \Delta t^2,\\\;
+  ///   \frac{\partial \Delta \bar{\boldsymbol{p}}_{ij}}{\partial \boldsymbol{b}^g}
+  ///   &= \sum_{k=i}^{j-1} \frac{\partial \Delta \bar{\boldsymbol{v}}_{ik}}{\partial \boldsymbol{b}^g} \Delta t
+  ///      - \frac{1}{2} \Delta \bar{\mathbf{R}}_{ik} \left(
+  ///     \tilde{\boldsymbol{a}}_k - \bar{\boldsymbol{b}}_i^a \right)^\wedge
+  ///     \frac{\partial \Delta \bar{\mathbf{R}}_{ik}}{\partial \boldsymbol{b}^g} \Delta t^2
+  /// \f}
   A.block<3, 3>(3, 9) =
       jacobian_biases_.block<3, 3>(6, 0) * dt - 0.5 * Rs * dt * dt;
   A.block<3, 3>(3, 12) =
@@ -134,6 +165,14 @@ void PreintegratedImuMeasurement::integrate(const Eigen::Vector3d& acc_true,
   jacobian_biases_.block<3, 3>(3, 3) += A.block<3, 3>(3, 12);
 
   // velocity: Eq. (69 1/2) from [A]
+  /// \f{align}{
+  ///   \frac{\partial \Delta \bar{\boldsymbol{v}}_{ij}}{\partial \boldsymbol{b}^a}
+  ///   &= - \sum_{k=i}^{j-1} \Delta \bar{\mathbf{R}}_{ik} \Delta t, \\\;
+  ///   \frac{\partial \Delta \bar{\boldsymbol{v}}_{ij}}{\partial \boldsymbol{b}^g}
+  ///   &= - \sum_{k=i}^{j-1} \Delta \bar{\mathbf{R}}_{ik} \left(
+  ///     \tilde{\boldsymbol{a}}_k - \bar{\boldsymbol{b}}_i^a \right)^\wedge
+  ///     \frac{\partial \Delta \bar{\mathbf{R}}_{ik}}{\partial \boldsymbol{b}^g} \Delta t
+  /// \f}
   A.block<3, 3>(6, 9) = -Rs * dt;
   A.block<3, 3>(6, 12) =
       -Rs * skew_acc * jacobian_biases_.block<3, 3>(0, 3) * dt;
@@ -141,6 +180,11 @@ void PreintegratedImuMeasurement::integrate(const Eigen::Vector3d& acc_true,
   jacobian_biases_.block<3, 3>(6, 3) += A.block<3, 3>(6, 12);
 
   // rotation: combining Eq. (69 1/2) and the tricks of Eq. (59) from [A]
+  /// \f{equation}{
+  ///   \frac{\partial \Delta \bar{\mathbf{R}}_{ij}}{\partial \boldsymbol{b}^g}
+  ///   = \Delta \bar{\mathbf{R}}_{j-1j}^\top \frac{\partial \Delta \bar{\mathbf{R}}_{ij-1}}{\partial \boldsymbol{b}^g}
+  ///     - \mathbf{J}_r^{j-1} \Delta t
+  /// \f}
   Eigen::Matrix3d dR_dbg_updated =
       dq.inverse().toRotationMatrix() * jacobian_biases_.block<3, 3>(0, 3) -
       Jr * dt;
@@ -159,8 +203,7 @@ void PreintegratedImuMeasurement::integrate(const Eigen::Vector3d& acc_true,
   }
   double vars_ba = pow(calib_.acc_bias_random_walk_sigma, 2) * dt;
   double vars_bg = pow(calib_.gyro_bias_random_walk_sigma, 2) * dt;
-  covs_.block<3, 3>(0, 0) +=
-      Eigen::Matrix3d::Identity() * vars_omega;  // omit Jr
+  covs_.block<3, 3>(0, 0) += Eigen::Matrix3d::Identity() * vars_omega;  // omit Jr
   covs_.block<3, 3>(3, 3) += Eigen::Matrix3d::Identity() * vars_p;
   covs_.block<3, 3>(6, 6) += Eigen::Matrix3d::Identity() * vars_v;
   covs_.block<3, 3>(9, 9) += Eigen::Matrix3d::Identity() * vars_ba;

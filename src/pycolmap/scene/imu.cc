@@ -15,8 +15,7 @@ using namespace pybind11::literals;
 namespace py = pybind11;
 
 void BindImu(py::module& m) {
-  py::class_ext_<ImuCalibration, std::shared_ptr<ImuCalibration>>
-      PyImuCalibration(m, "ImuCalibration");
+  py::classh_ext<ImuCalibration> PyImuCalibration(m, "ImuCalibration");
   PyImuCalibration.def(py::init<>())
       .def_readwrite("acc_noise_density", &ImuCalibration::acc_noise_density)
       .def_readwrite("gyro_noise_density", &ImuCalibration::gyro_noise_density)
@@ -31,8 +30,7 @@ void BindImu(py::module& m) {
       .def_readwrite("imu_rate", &ImuCalibration::imu_rate);
   MakeDataclass(PyImuCalibration);
 
-  py::class_ext_<ImuMeasurement, std::shared_ptr<ImuMeasurement>>
-      PyImuMeasurement(m, "ImuMeasurement");
+  py::classh_ext<ImuMeasurement> PyImuMeasurement(m, "ImuMeasurement");
   PyImuMeasurement.def(py::init<>())
       .def(py::init<const double,
                     const Eigen::Vector3d&,

@@ -9,17 +9,16 @@ from pathlib import Path
 
 import numpy as np
 import pyceres
-import wget
 
 import pycolmap
 from pycolmap import logging
 
 
 def add_imu_residuals(
-    prob,
-    reconstruction,
-    preintegrated_measurements,
-    variables,
+    prob: pyceres.Problem,
+    reconstruction: pycolmap.Reconstruction,
+    preintegrated_measurements: dict[int, pycolmap.PreintegratedImuMeasurement],
+    variables: dict,
     optimize_scale=True,
     optimize_gravity=True,
     optimize_imu_from_cam=True,
@@ -27,8 +26,8 @@ def add_imu_residuals(
 ):
     loss = pyceres.TrivialLoss()
     for image_id, integrated_m in preintegrated_measurements.items():
-        i_from_world = reconstruction.images[image_id].cam_from_world
-        j_from_world = reconstruction.images[image_id + 1].cam_from_world
+        i_from_world = reconstruction.images[image_id].cam_from_world()
+        j_from_world = reconstruction.images[image_id + 1].cam_from_world()
 
         prob.add_residual_block(
             pycolmap.PreintegratedImuMeasurementCost(integrated_m),
@@ -72,7 +71,11 @@ def add_imu_residuals(
 
 
 def solve_bundle_adjustment(
-    reconstruction, ba_options, ba_config, preintegrated_measurements, variables
+    reconstruction: pycolmap.Reconstruction,
+    ba_options: pycolmap.BundleAdjustmentOptions,
+    ba_config: pycolmap.BundleAdjustmentConfig,
+    preintegrated_measurements: dict[int, pycolmap.PreintegratedImuMeasurement],
+    variables: dict
 ):
     bundle_adjuster = pycolmap.create_default_bundle_adjuster(
         ba_options, ba_config, reconstruction
@@ -90,7 +93,11 @@ def solve_bundle_adjustment(
 
 
 def adjust_global_bundle(
-    mapper, mapper_options, ba_options, preintegrated_measurements, variables
+    mapper: pycolmap.IncrementalMapper,
+    mapper_options: pycolmap.IncrementalMapperOptions,
+    ba_options: pycolmap.BundleAdjustmentOptions,
+    preintegrated_measurements: dict[int, pycolmap.PreintegratedImuMeasurement],
+    variables: dict
 ):
     reconstruction = mapper.reconstruction
 
@@ -115,14 +122,14 @@ def adjust_global_bundle(
 
 
 def run_iterative(
-    mapper,
-    max_num_refinements,
-    max_refinement_change,
-    mapper_options,
-    ba_options,
-    tri_options,
-    preintegrated_measurements,
-    variables,
+    mapper: pycolmap.IncrementalMapper,
+    max_num_refinements: int,
+    max_refinement_change: float,
+    mapper_options: pycolmap.IncrementalMapperOptions,
+    ba_options: pycolmap.BundleAdjustmentOptions,
+    tri_options: pycolmap.IncrementalTriangulatorOptions,
+    preintegrated_measurements: dict[int, pycolmap.PreintegratedImuMeasurement],
+    variables: dict,
     normalize_reconstruction=True,
 ):
     """Equivalent to mapper.iterative_global_refinement(...)"""
@@ -156,7 +163,11 @@ def run_iterative(
 
 
 def iterative_global_refinement(
-    options, mapper_options, mapper, preintegrated_measurements, variables
+    options: pycolmap.IncrementalPipelineOptions,
+    mapper_options: pycolmap.IncrementalMapperOptions,
+    mapper: pycolmap.IncrementalMapper,
+    preintegrated_measurements: dict[int, pycolmap.PreintegratedImuMeasurement],
+    variables: dict
 ):
     ba_options = options.get_global_bundle_adjustment()
     ba_options.print_summary = True
@@ -173,13 +184,16 @@ def iterative_global_refinement(
         variables,
         normalize_reconstruction=False,
     )
-    mapper.filter_images(mapper_options)
+    mapper.filter_frames(mapper_options)
 
 
 def iterative_refine(
-    database_path, recon, preintegrated_measurements, variables
+    database_path: str,
+    recon: pycolmap.Reconstruction,
+    preintegrated_measurements: dict[int, pycolmap.PreintegratedImuMeasurement],
+    variables: dict
 ):
-    database = pycolmap.Database(database_path)
+    database = pycolmap.Database.open(database_path)
     image_names = []
     for image_id in recon.reg_image_ids():
         image_names.append(recon.images[image_id].name)
@@ -189,7 +203,6 @@ def iterative_refine(
     mapper = pycolmap.IncrementalMapper(database_cache)
     mapper.begin_reconstruction(recon)
     options = pycolmap.IncrementalPipelineOptions()
-    options.fix_existing_images = False
     iterative_global_refinement(
         options,
         options.get_mapper(),
@@ -204,7 +217,7 @@ def run_vi_optimization(
     sfm_path: str,
     database_path: str,
     output_folder: str,
-    preintegrated_measurements: dict,
+    preintegrated_measurements: dict[int, pycolmap.PreintegratedImuMeasurement],
     variables: dict,
 ):
     rec = pycolmap.Reconstruction(sfm_path)
@@ -219,6 +232,7 @@ def download_data():
     data_url = "https://polybox.ethz.ch/index.php/s/NS6ozZswc90hzt4/download"
     data_path = Path("sample_data")
     if not data_path.exists():
+        import wget
         logging.info("Downloading the data.")
         zip_path = "sample_data.zip"
         wget.download(data_url, str(zip_path))
@@ -280,8 +294,8 @@ def run():
     for i in np.arange(1, num_images):
         variables["imu_states"][i] = pycolmap.ImuState()
         t1, t2 = image_timestamps[i] / 1e9, image_timestamps[i + 1] / 1e9
-        pi = reconstruction.images[i].cam_from_world.inverse().translation
-        pj = reconstruction.images[i + 1].cam_from_world.inverse().translation
+        pi = reconstruction.images[i].cam_from_world().inverse().translation
+        pj = reconstruction.images[i + 1].cam_from_world().inverse().translation
         vel = (pj - pi) / (t2 - t1)
         variables["imu_states"][i].set_velocity(vel)
 

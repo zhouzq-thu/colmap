@@ -154,9 +154,9 @@ class PreintegratedImuMeasurement {
 class PreintegratedImuMeasurementCostFunction {
  public:
   explicit PreintegratedImuMeasurementCostFunction(
-      const PreintegratedImuMeasurement& m)
-      : measurement_(m) {
-    if (!measurement_.HasFinished()) measurement_.Finish();
+      const PreintegratedImuMeasurement& m) {
+    measurement_ = (PreintegratedImuMeasurement *)&m;
+    if (!measurement_->HasFinished()) measurement_->Finish();
   }
 
   static ceres::CostFunction* Create(const PreintegratedImuMeasurement& m) {
@@ -193,20 +193,20 @@ class PreintegratedImuMeasurementCostFunction {
     for (size_t i = 0; i < 6; ++i) {
       biases_double(i) = ConvertToDouble<T>::convert(i_imu_state[i + 3]);
     }
-    if (measurement_.CheckReintegrate(biases_double))
-      measurement_.Reintegrate(biases_double);
+    if (measurement_->CheckReintegrate(biases_double))
+      measurement_->Reintegrate(biases_double);
     // Compute residuals
     // imu state
     EigenVector3Map<T> v_i_data(i_imu_state);
     EigenVector3Map<T> v_j_data(j_imu_state);
     Eigen::Matrix<T, 6, 1> delta_b =
         Eigen::Map<const Eigen::Matrix<T, 6, 1>>(i_imu_state + 3) -
-        measurement_.Biases().cast<T>();
+        measurement_->Biases().cast<T>();
     EigenVector3Map<T> delta_b_a(delta_b.data());
     EigenVector3Map<T> delta_b_g(delta_b.data() + 3);
-    const T dt = T(measurement_.DeltaT());
+    const T dt = T(measurement_->DeltaT());
     Eigen::Matrix<T, 3, 1> gravity = EigenVector3Map<T>(gravity_direction) *
-                                     T(measurement_.GravityMagnitude());
+                                     T(measurement_->GravityMagnitude());
 
     // change frame (measure the extrinsics from imu to world)
     // T_world_from_imu = T_world_from_cam * T_cam_from_imu
@@ -242,10 +242,10 @@ class PreintegratedImuMeasurementCostFunction {
     const Eigen::Quaternion<T> j_from_i_q =
         world_from_i_imu_q.inverse() * world_from_j_imu_q;
     Eigen::Matrix<T, 3, 1> omega_bias =
-        measurement_.dR_dbg().cast<T>() * delta_b_g;
+        measurement_->dR_dbg().cast<T>() * delta_b_g;
     Eigen::Quaternion<T> Dq_bias;
     EigenAngleAxisToQuaternion(omega_bias.data(), Dq_bias.coeffs().data());
-    const Eigen::Quaternion<T> Dq = measurement_.DeltaR().cast<T>() * Dq_bias;
+    const Eigen::Quaternion<T> Dq = measurement_->DeltaR().cast<T>() * Dq_bias;
     const Eigen::Quaternion<T> param_from_measured_q =
         (Dq.inverse() * j_from_i_q).normalized();
     EigenQuaternionToAngleAxis(param_from_measured_q.coeffs().data(),
@@ -256,9 +256,9 @@ class PreintegratedImuMeasurementCostFunction {
     Eigen::Matrix<T, 3, 1> est_dp =
         world_from_i_imu_q.inverse() *
         (j_from_i_p - v_i * dt - 0.5 * gravity * dt * dt);
-    Eigen::Matrix<T, 3, 1> Dp = measurement_.DeltaP().cast<T>() +
-                                measurement_.dp_dba().cast<T>() * delta_b_a +
-                                measurement_.dp_dbg().cast<T>() * delta_b_g;
+    Eigen::Matrix<T, 3, 1> Dp = measurement_->DeltaP().cast<T>() +
+                                measurement_->dp_dba().cast<T>() * delta_b_a +
+                                measurement_->dp_dbg().cast<T>() * delta_b_g;
     Eigen::Map<Eigen::Matrix<T, 3, 1>> param_from_measured_p(residuals + 3);
     param_from_measured_p = est_dp - Dp;
 
@@ -266,9 +266,9 @@ class PreintegratedImuMeasurementCostFunction {
     const Eigen::Matrix<T, 3, 1> j_from_i_v = v_j - v_i;
     Eigen::Matrix<T, 3, 1> est_dv =
         world_from_i_imu_q.inverse() * (j_from_i_v - gravity * dt);
-    Eigen::Matrix<T, 3, 1> Dv = measurement_.DeltaV().cast<T>() +
-                                measurement_.dv_dba().cast<T>() * delta_b_a +
-                                measurement_.dv_dbg().cast<T>() * delta_b_g;
+    Eigen::Matrix<T, 3, 1> Dv = measurement_->DeltaV().cast<T>() +
+                                measurement_->dv_dba().cast<T>() * delta_b_a +
+                                measurement_->dv_dbg().cast<T>() * delta_b_g;
     Eigen::Map<Eigen::Matrix<T, 3, 1>> param_from_measured_v(residuals + 6);
     param_from_measured_v = est_dv - Dv;
 
@@ -279,12 +279,12 @@ class PreintegratedImuMeasurementCostFunction {
 
     // Weight by the covariance inverse
     Eigen::Map<Eigen::Matrix<T, 15, 1>> residuals_data(residuals);
-    residuals_data.applyOnTheLeft(measurement_.SqrtInformation().cast<T>());
+    // residuals_data.applyOnTheLeft(measurement_->SqrtInformation().cast<T>());
     return true;
   }
 
  private:
-  mutable PreintegratedImuMeasurement measurement_;
+  PreintegratedImuMeasurement *measurement_;
 
   // Convert from type T (including ceres::Jet) to double
   // default case: return the value directly
