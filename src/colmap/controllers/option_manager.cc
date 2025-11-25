@@ -564,6 +564,10 @@ void OptionManager::AddMapperOptions() {
   AddAndRegisterDefaultOption("Mapper.init_image_id2", &mapper->init_image_id2);
   AddAndRegisterDefaultOption("Mapper.init_num_trials",
                               &mapper->init_num_trials);
+  AddAndRegisterDefaultOption("Mapper.structure_less_registration_fallback",
+                              &mapper->structure_less_registration_fallback);
+  AddAndRegisterDefaultOption("Mapper.structure_less_registration_only",
+                              &mapper->structure_less_registration_only);
   AddAndRegisterDefaultOption("Mapper.extract_colors", &mapper->extract_colors);
   AddAndRegisterDefaultOption("Mapper.num_threads", &mapper->num_threads);
   AddAndRegisterDefaultOption("Mapper.random_seed", &mapper->random_seed);
@@ -848,6 +852,7 @@ void OptionManager::Reset() {
   added_image_options_ = false;
   added_feature_extraction_options_ = false;
   added_feature_matching_options_ = false;
+  added_two_view_geometry_options_ = false;
   added_exhaustive_pairing_options_ = false;
   added_sequential_pairing_options_ = false;
   added_vocab_tree_pairing_options_ = false;
