@@ -29,11 +29,41 @@
 
 #include "colmap/scene/database.h"
 #include "colmap/util/endian.h"
-#include "colmap/util/sqlite3_utils.h"
 #include "colmap/util/string.h"
+
+#include <sqlite3.h>
 
 namespace colmap {
 namespace {
+
+inline int SQLite3CallHelper(int result_code,
+                             const std::string& filename,
+                             int line) {
+  switch (result_code) {
+    case SQLITE_OK:
+    case SQLITE_ROW:
+    case SQLITE_DONE:
+      return result_code;
+    default:
+      LogMessageFatalThrow<std::runtime_error>(filename.c_str(), line).stream()
+          << "SQLite error: " << sqlite3_errstr(result_code);
+      return result_code;
+  }
+}
+
+#define SQLITE3_CALL(func) SQLite3CallHelper(func, __FILE__, __LINE__)
+
+#define SQLITE3_EXEC(database, sql, callback)                             \
+  {                                                                       \
+    char* err_msg = nullptr;                                              \
+    const int result_code = sqlite3_exec(                                 \
+        THROW_CHECK_NOTNULL(database), sql, callback, nullptr, &err_msg); \
+    if (result_code != SQLITE_OK) {                                       \
+      LOG(ERROR) << "SQLite error [" << __FILE__ << ", line " << __LINE__ \
+                 << "]: " << err_msg;                                     \
+      sqlite3_free(err_msg);                                              \
+    }                                                                     \
+  }
 
 struct Sqlite3StmtContext {
   explicit Sqlite3StmtContext(sqlite3_stmt* sql_stmt)
@@ -45,7 +75,9 @@ struct Sqlite3StmtContext {
 };
 
 void SwapFeatureMatchesBlob(FeatureMatchesBlob* matches) {
-  matches->col(0).swap(matches->col(1));
+  for (Eigen::Index i = 0; i < matches->rows(); ++i) {
+    std::swap((*matches)(i, 0), (*matches)(i, 1));
+  }
 }
 
 FeatureKeypointsBlob FeatureKeypointsToBlob(const FeatureKeypoints& keypoints) {
@@ -509,8 +541,8 @@ class SqliteDatabase : public Database {
                        ImagePairToPairId(image_id1, image_id2));
   }
 
-  bool ExistsInlierMatches(const image_t image_id1,
-                           const image_t image_id2) const override {
+  bool ExistsTwoViewGeometry(const image_t image_id1,
+                             const image_t image_id2) const override {
     return ExistsRowId(sql_stmt_exists_two_view_geometry_,
                        ImagePairToPairId(image_id1, image_id2));
   }
@@ -1128,6 +1160,9 @@ class SqliteDatabase : public Database {
   void WriteTwoViewGeometry(const image_t image_id1,
                             const image_t image_id2,
                             const TwoViewGeometry& two_view_geometry) override {
+    THROW_CHECK(!ExistsTwoViewGeometry(image_id1, image_id2))
+        << "Two view geometry between image " << image_id1 << " and "
+        << image_id2 << " already exists.";
     Sqlite3StmtContext context(sql_stmt_write_two_view_geometry_);
 
     const image_pair_t pair_id = ImagePairToPairId(image_id1, image_id2);
@@ -1314,6 +1349,18 @@ class SqliteDatabase : public Database {
     SQLITE3_CALL(sqlite3_step(sql_stmt_update_keypoints_));
   }
 
+  void UpdateTwoViewGeometry(
+      const image_t image_id1,
+      const image_t image_id2,
+      const TwoViewGeometry& two_view_geometry) override {
+    // Do nothing if the image pair does not exist, to align with the UPDATE
+    // behavior in SQL.
+    if (ExistsTwoViewGeometry(image_id1, image_id2)) {
+      DeleteTwoViewGeometry(image_id1, image_id2);
+      WriteTwoViewGeometry(image_id1, image_id2, two_view_geometry);
+    }
+  }
+
   void DeleteMatches(const image_t image_id1,
                      const image_t image_id2) override {
     Sqlite3StmtContext context(sql_stmt_delete_matches_);
@@ -1325,8 +1372,8 @@ class SqliteDatabase : public Database {
     database_entry_deleted_ = true;
   }
 
-  void DeleteInlierMatches(const image_t image_id1,
-                           const image_t image_id2) override {
+  void DeleteTwoViewGeometry(const image_t image_id1,
+                             const image_t image_id2) override {
     Sqlite3StmtContext context(sql_stmt_delete_two_view_geometry_);
 
     const image_pair_t pair_id = ImagePairToPairId(image_id1, image_id2);
@@ -1335,6 +1382,16 @@ class SqliteDatabase : public Database {
                                     static_cast<sqlite3_int64>(pair_id)));
     SQLITE3_CALL(sqlite3_step(sql_stmt_delete_two_view_geometry_));
     database_entry_deleted_ = true;
+  }
+
+  void DeleteInlierMatches(const image_t image_id1,
+                           const image_t image_id2) override {
+    if (!ExistsTwoViewGeometry(image_id1, image_id2)) {
+      return;
+    }
+    TwoViewGeometry geom = ReadTwoViewGeometry(image_id1, image_id2);
+    geom.inlier_matches.clear();
+    UpdateTwoViewGeometry(image_id1, image_id2, geom);
   }
 
   void ClearAllTables() override {

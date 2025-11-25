@@ -101,7 +101,7 @@ void SynthesizeExhaustiveMatches(double inlier_match_ratio,
       if (!database->ExistsMatches(image_id1, image_id2)) {
         database->WriteMatches(image_id1, image_id2, matches);
       }
-      if (!database->ExistsInlierMatches(image_id1, image_id2)) {
+      if (!database->ExistsTwoViewGeometry(image_id1, image_id2)) {
         database->WriteTwoViewGeometry(image_id1, image_id2, two_view_geometry);
       }
     }
@@ -162,7 +162,7 @@ void SynthesizeChainedMatches(double inlier_match_ratio,
     if (!database->ExistsMatches(image_id1, image_id2)) {
       database->WriteMatches(image_id1, image_id2, matches);
     }
-    if (!database->ExistsInlierMatches(image_id1, image_id2)) {
+    if (!database->ExistsTwoViewGeometry(image_id1, image_id2)) {
       database->WriteTwoViewGeometry(image_id1, image_id2, two_view_geometry);
     }
   }
@@ -516,7 +516,8 @@ void SynthesizeImages(const SyntheticImageOptions& options,
     for (const auto& point2D : image.Points2D()) {
       const int x = static_cast<int>(std::round(point2D.xy(0)));
       const int y = static_cast<int>(std::round(point2D.xy(1)));
-      if (x < 0 || y < 0 || x >= camera.width || y >= camera.height) {
+      if (x < 0 || y < 0 || x >= static_cast<int>(camera.width) ||
+          y >= static_cast<int>(camera.height)) {
         continue;
       }
 
