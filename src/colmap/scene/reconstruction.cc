@@ -260,11 +260,33 @@ void Reconstruction::AddCamera(struct Camera camera) {
   THROW_CHECK(cameras_.emplace(camera_id, std::move(camera)).second);
 }
 
+void Reconstruction::AddCameraWithTrivialRig(struct Camera camera) {
+  THROW_CHECK(!ExistsRig(camera.camera_id))
+      << "AddCameraWithTrivialRig tried to add a rig with the same id as the "
+         "camera, but failed because Rig "
+      << camera.camera_id << "already exists in the reconstruction. ";
+  class Rig rig;
+  rig.SetRigId(camera.camera_id);
+  rig.AddRefSensor(camera.SensorId());
+  AddCamera(std::move(camera));
+  AddRig(rig);
+}
+
 void Reconstruction::AddFrame(class Frame frame) {
   THROW_CHECK(frame.HasRigId());
   auto& rig = Rig(frame.RigId());
   for (const auto& data_id : frame.DataIds()) {
-    THROW_CHECK(rig.HasSensor(data_id.sensor_id));
+    switch (data_id.sensor_id.type) {
+      case SensorType::CAMERA:
+        THROW_CHECK(rig.HasSensor(data_id.sensor_id));
+        break;
+      case SensorType::IMU:
+        // Note that we do not (yet) support IMU measurement data.
+        break;
+      case SensorType::INVALID:
+        LOG(FATAL_THROW) << "Invalid sensor type: " << data_id.sensor_id.type;
+        break;
+    }
   }
   if (frame.HasRigPtr()) {
     THROW_CHECK_EQ(frame.RigPtr(), &rig);
@@ -298,6 +320,40 @@ void Reconstruction::AddImage(class Image image) {
   }
   const image_t image_id = image.ImageId();
   THROW_CHECK(images_.emplace(image_id, std::move(image)).second);
+}
+
+void Reconstruction::AddImageWithTrivialFrame(class Image image) {
+  THROW_CHECK(!ExistsFrame(image.ImageId()))
+      << "AddImageWithTrivialFrame tried to add a frame with the same id as "
+         "the image, but failed because Frame "
+      << image.ImageId() << "already exists in the reconstruction.";
+  THROW_CHECK(ExistsRig(image.CameraId()))
+      << "Rig " << image.CameraId() << " that contains Camera "
+      << image.CameraId() << " does not exist in the reconstruction.";
+  auto& rig = Rig(image.CameraId());
+  THROW_CHECK_EQ(rig.NumSensors(), 1)
+      << "AddImageWithTrivialFrame requires that the camera is from a rig that "
+         "contains exactly one sensor (the camera itself).";
+  THROW_CHECK(rig.IsRefSensor(Camera(image.CameraId()).SensorId()));
+  class Frame frame;
+  frame.SetFrameId(image.ImageId());
+  frame.SetRigId(image.CameraId());
+  frame.AddDataId(image.DataId());
+  if (image.HasFrameId()) {
+    THROW_CHECK_EQ(image.FrameId(), frame.FrameId());
+  } else {
+    image.SetFrameId(frame.FrameId());
+  }
+  AddFrame(frame);
+  AddImage(std::move(image));
+}
+
+void Reconstruction::AddImageWithTrivialFrame(class Image image,
+                                              const Rigid3d& cam_from_world) {
+  const frame_t frame_id = image.ImageId();
+  AddImageWithTrivialFrame(std::move(image));
+  Frame(frame_id).SetRigFromWorld(cam_from_world);
+  RegisterFrame(frame_id);
 }
 
 void Reconstruction::AddPoint3D(const point3D_t point3D_id,
@@ -640,21 +696,34 @@ void Reconstruction::TranscribeImageIdsToDatabase(const Database& database) {
   std::unordered_map<image_t, class Image> new_images;
   new_images.reserve(NumImages());
 
-  for (auto& image : images_) {
+  for (auto& [_, image] : images_) {
     const std::optional<class Image> database_image =
-        database.ReadImageWithName(image.second.Name());
+        database.ReadImageWithName(image.Name());
     if (!database_image.has_value()) {
-      LOG(FATAL_THROW) << "Image with name " << image.second.Name()
+      LOG(FATAL_THROW) << "Image with name " << image.Name()
                        << " does not exist in database";
     }
-    old_to_new_image_ids.emplace(image.second.ImageId(),
-                                 database_image->ImageId());
-    image.second.SetImageId(database_image->ImageId());
-    new_images.emplace(database_image->ImageId(), image.second);
+    old_to_new_image_ids.emplace(image.ImageId(), database_image->ImageId());
+    image.SetImageId(database_image->ImageId());
+    THROW_CHECK(new_images.emplace(database_image->ImageId(), image).second);
   }
 
   images_ = std::move(new_images);
 
+  // Transcribe frame data.
+  for (auto& [_, frame] : frames_) {
+    auto new_frame = frame;
+    new_frame.ClearDataIds();
+    for (data_t data_id : frame.DataIds()) {
+      if (data_id.sensor_id.type == SensorType::CAMERA) {
+        data_id.id = old_to_new_image_ids.at(data_id.id);
+      }
+      new_frame.AddDataId(data_id);
+    }
+    frame = std::move(new_frame);
+  }
+
+  // Transcribe point tracks.
   for (auto& point3D : points3D_) {
     for (auto& track_el : point3D.second.track.Elements()) {
       track_el.image_id = old_to_new_image_ids.at(track_el.image_id);
@@ -842,7 +911,8 @@ bool Reconstruction::ExtractColorsForImage(const image_t image_id,
   const class Image& image = Image(image_id);
 
   Bitmap bitmap;
-  if (!bitmap.Read(JoinPaths(path, image.Name()))) {
+  if (!bitmap.Read(JoinPaths(path, image.Name()),
+                   /*as_rgb=*/true)) {
     return false;
   }
 
@@ -874,7 +944,8 @@ void Reconstruction::ExtractColorsForAllImages(const std::string& path) {
     const std::string image_path = JoinPaths(path, image.Name());
 
     Bitmap bitmap;
-    if (!bitmap.Read(image_path)) {
+    if (!bitmap.Read(image_path,
+                     /*as_rgb=*/true)) {
       LOG(WARNING) << "Could not read image " << image.Name() << " at path "
                    << image_path;
       continue;

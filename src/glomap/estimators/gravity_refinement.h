@@ -1,7 +1,6 @@
 #pragma once
 
 #include "glomap/estimators/optimization_base.h"
-#include "glomap/math/rigid3d.h"
 #include "glomap/scene/types_sfm.h"
 #include "glomap/types.h"
 
@@ -21,22 +20,26 @@ struct GravityRefinerOptions : public OptimizationBaseOptions {
 
   std::shared_ptr<ceres::LossFunction> CreateLossFunction() {
     return std::make_shared<ceres::ArctanLoss>(
-        1 - std::cos(DegToRad(max_gravity_error)));
+        1 - std::cos(colmap::DegToRad(max_gravity_error)));
   }
 };
 
 class GravityRefiner {
  public:
-  GravityRefiner(const GravityRefinerOptions& options) : options_(options) {}
+  explicit GravityRefiner(const GravityRefinerOptions& options)
+      : options_(options) {}
+
   void RefineGravity(const ViewGraph& view_graph,
-                     std::unordered_map<frame_t, Frame>& frames,
-                     std::unordered_map<image_t, Image>& images);
+                     const std::unordered_map<frame_t, Frame>& frames,
+                     const std::unordered_map<image_t, Image>& images,
+                     std::vector<colmap::PosePrior>& pose_priors);
 
  private:
   void IdentifyErrorProneGravity(
       const ViewGraph& view_graph,
       const std::unordered_map<frame_t, Frame>& frames,
       const std::unordered_map<image_t, Image>& images,
+      std::unordered_map<image_t, colmap::PosePrior*>& image_to_pose_prior,
       std::unordered_set<image_t>& error_prone_images);
   GravityRefinerOptions options_;
   std::shared_ptr<ceres::LossFunction> loss_function_;

@@ -4,7 +4,6 @@
 #include "colmap/util/misc.h"
 
 #include "glomap/estimators/cost_function.h"
-#include "glomap/math/rigid3d.h"
 
 namespace glomap {
 namespace {
@@ -31,7 +30,7 @@ bool GlobalPositioner::Solve(
     std::unordered_map<camera_t, colmap::Camera>& cameras,
     std::unordered_map<frame_t, Frame>& frames,
     std::unordered_map<image_t, Image>& images,
-    std::unordered_map<track_t, Track>& tracks) {
+    std::unordered_map<point3D_t, Point3D>& tracks) {
   if (rigs.size() > 1) {
     LOG(ERROR) << "Number of camera rigs = " << rigs.size();
   }
@@ -89,14 +88,14 @@ bool GlobalPositioner::Solve(
     LOG(INFO) << summary.BriefReport();
   }
 
-  ConvertResults(rigs, frames);
+  ConvertBackResults(rigs, frames);
   return summary.IsSolutionUsable();
 }
 
 void GlobalPositioner::SetupProblem(
     const ViewGraph& view_graph,
     const std::unordered_map<rig_t, Rig>& rigs,
-    const std::unordered_map<track_t, Track>& tracks) {
+    const std::unordered_map<point3D_t, Point3D>& tracks) {
   ceres::Problem::Options problem_options;
   problem_options.loss_function_ownership = ceres::DO_NOT_TAKE_OWNERSHIP;
   problem_ = std::make_unique<ceres::Problem>(problem_options);
@@ -111,8 +110,8 @@ void GlobalPositioner::SetupProblem(
       std::accumulate(tracks.begin(),
                       tracks.end(),
                       0,
-                      [](int sum, const std::pair<track_t, Track>& track) {
-                        return sum + track.second.observations.size();
+                      [](int sum, const std::pair<point3D_t, Point3D>& track) {
+                        return sum + track.second.track.Length();
                       }));
 
   // Initialize the rig scales to be 1.0.
@@ -125,29 +124,32 @@ void GlobalPositioner::InitializeRandomPositions(
     const ViewGraph& view_graph,
     std::unordered_map<frame_t, Frame>& frames,
     std::unordered_map<image_t, Image>& images,
-    std::unordered_map<track_t, Track>& tracks) {
+    std::unordered_map<point3D_t, Point3D>& tracks) {
   std::unordered_set<image_t> constrained_positions;
   constrained_positions.reserve(frames.size());
   for (const auto& [pair_id, image_pair] : view_graph.image_pairs) {
     if (image_pair.is_valid == false) continue;
-    constrained_positions.insert(images[image_pair.image_id1].frame_id);
-    constrained_positions.insert(images[image_pair.image_id2].frame_id);
+    constrained_positions.insert(images[image_pair.image_id1].FrameId());
+    constrained_positions.insert(images[image_pair.image_id2].FrameId());
   }
 
   for (const auto& [track_id, track] : tracks) {
-    if (track.observations.size() < options_.min_num_view_per_track) continue;
-    for (const auto& observation : tracks[track_id].observations) {
-      if (images.find(observation.first) == images.end()) continue;
-      Image& image = images[observation.first];
-      if (!image.IsRegistered()) continue;
-      constrained_positions.insert(images[observation.first].frame_id);
+    if (track.track.Length() < options_.min_num_view_per_track) continue;
+    for (const auto& observation : tracks[track_id].track.Elements()) {
+      if (images.find(observation.image_id) == images.end()) continue;
+      Image& image = images[observation.image_id];
+      if (!image.HasPose()) continue;
+      constrained_positions.insert(images[observation.image_id].FrameId());
     }
   }
 
   if (!options_.generate_random_positions || !options_.optimize_positions) {
     for (auto& [frame_id, frame] : frames) {
-      if (constrained_positions.find(frame_id) != constrained_positions.end())
-        frame.RigFromWorld().translation = CenterFromPose(frame.RigFromWorld());
+      if (constrained_positions.find(frame_id) != constrained_positions.end()) {
+        // Will be converted back to rig_from_world after the optimization.
+        frame.RigFromWorld().translation =
+            frame.RigFromWorld().TgtOriginInSrc();
+      }
     }
     return;
   }
@@ -155,11 +157,13 @@ void GlobalPositioner::InitializeRandomPositions(
   // Generate random positions for the cameras centers.
   for (auto& [frame_id, frame] : frames) {
     // Only set the cameras to be random if they are needed to be optimized
-    if (constrained_positions.find(frame_id) != constrained_positions.end())
+    if (constrained_positions.find(frame_id) != constrained_positions.end()) {
       frame.RigFromWorld().translation =
           100.0 * RandVector3d(random_generator_, -1, 1);
-    else
-      frame.RigFromWorld().translation = CenterFromPose(frame.RigFromWorld());
+    } else {
+      // Will be converted back to rig_from_world after the optimization.
+      frame.RigFromWorld().translation = frame.RigFromWorld().TgtOriginInSrc();
+    }
   }
 
   VLOG(2) << "Constrained positions: " << constrained_positions.size();
@@ -169,8 +173,8 @@ void GlobalPositioner::AddCameraToCameraConstraints(
     const ViewGraph& view_graph, std::unordered_map<image_t, Image>& images) {
   // For cam to cam constraint, only support the trivial frames now
   for (const auto& [image_id, image] : images) {
-    if (!image.IsRegistered()) continue;
-    if (!image.HasTrivialFrame()) {
+    if (!image.HasPose()) continue;
+    if (!image.IsRefInFrame()) {
       LOG(ERROR) << "Now, only trivial frames are supported for the camera to "
                     "camera constraints";
     }
@@ -198,8 +202,8 @@ void GlobalPositioner::AddCameraToCameraConstraints(
     problem_->AddResidualBlock(
         cost_function,
         loss_function_.get(),
-        images[image_id1].frame_ptr->RigFromWorld().translation.data(),
-        images[image_id2].frame_ptr->RigFromWorld().translation.data(),
+        images[image_id1].FramePtr()->RigFromWorld().translation.data(),
+        images[image_id2].FramePtr()->RigFromWorld().translation.data(),
         &scale);
 
     problem_->SetParameterLowerBound(&scale, 0, 1e-5);
@@ -215,7 +219,7 @@ void GlobalPositioner::AddPointToCameraConstraints(
     std::unordered_map<camera_t, colmap::Camera>& cameras,
     std::unordered_map<frame_t, Frame>& frames,
     std::unordered_map<image_t, Image>& images,
-    std::unordered_map<track_t, Track>& tracks) {
+    std::unordered_map<point3D_t, Point3D>& tracks) {
   // The number of camera-to-camera constraints coming from the relative poses
 
   const size_t num_cam_to_cam = problem_->NumResidualBlocks();
@@ -256,51 +260,55 @@ void GlobalPositioner::AddPointToCameraConstraints(
   }
 
   for (auto& [track_id, track] : tracks) {
-    if (track.observations.size() < options_.min_num_view_per_track) continue;
-
-    // Only set the points to be random if they are needed to be optimized
-    if (options_.optimize_points && options_.generate_random_points) {
-      track.xyz = 100.0 * RandVector3d(random_generator_, -1, 1);
-      track.is_initialized = true;
-    }
+    if (track.track.Length() < options_.min_num_view_per_track) continue;
 
     AddTrackToProblem(track_id, rigs, cameras, frames, images, tracks);
   }
 }
 
 void GlobalPositioner::AddTrackToProblem(
-    track_t track_id,
+    point3D_t track_id,
     std::unordered_map<rig_t, Rig>& rigs,
     std::unordered_map<camera_t, colmap::Camera>& cameras,
     std::unordered_map<frame_t, Frame>& frames,
     std::unordered_map<image_t, Image>& images,
-    std::unordered_map<track_t, Track>& tracks) {
-  // For each view in the track add the point to camera correspondences.
-  for (const auto& observation : tracks[track_id].observations) {
-    if (images.find(observation.first) == images.end()) continue;
+    std::unordered_map<point3D_t, Point3D>& tracks) {
+  const bool random_initialization =
+      options_.optimize_points && options_.generate_random_points;
 
-    Image& image = images[observation.first];
-    if (!image.IsRegistered()) continue;
+  Point3D& track = tracks[track_id];
+
+  // Only set the points to be random if they are needed to be optimized
+  if (random_initialization) {
+    track.xyz = 100.0 * RandVector3d(random_generator_, -1, 1);
+  }
+
+  // For each view in the track add the point to camera correspondences.
+  for (const auto& observation : track.track.Elements()) {
+    if (images.find(observation.image_id) == images.end()) continue;
+
+    Image& image = images[observation.image_id];
+    if (!image.HasPose()) continue;
 
     const Eigen::Vector3d& feature_undist =
-        image.features_undist[observation.second];
+        image.features_undist[observation.point2D_idx];
     if (feature_undist.array().isNaN().any()) {
       LOG(WARNING)
           << "Ignoring feature because it failed to undistort: track_id="
-          << track_id << ", image_id=" << observation.first
-          << ", feature_id=" << observation.second;
+          << track_id << ", image_id=" << observation.image_id
+          << ", feature_id=" << observation.point2D_idx;
       continue;
     }
 
     const Eigen::Vector3d translation =
         image.CamFromWorld().rotation.inverse() *
-        image.features_undist[observation.second];
+        image.features_undist[observation.point2D_idx];
 
     double& scale = scales_.emplace_back(1);
 
-    if (!options_.generate_scales && tracks[track_id].is_initialized) {
+    if (!options_.generate_scales && random_initialization) {
       const Eigen::Vector3d trans_calc =
-          tracks[track_id].xyz - image.CamFromWorld().translation;
+          track.xyz - image.CamFromWorld().translation;
       scale = std::max(1e-5,
                        translation.dot(trans_calc) / trans_calc.squaredNorm());
     }
@@ -312,34 +320,32 @@ void GlobalPositioner::AddTrackToProblem(
     // functions
     // Down weight the uncalibrated cameras
     ceres::LossFunction* loss_function =
-        (cameras[image.camera_id].has_prior_focal_length)
+        (cameras[image.CameraId()].has_prior_focal_length)
             ? loss_function_ptcam_calibrated_.get()
             : loss_function_ptcam_uncalibrated_.get();
 
     // If the image is not part of a camera rig, use the standard BATA error
-    if (image.HasTrivialFrame()) {
+    if (image.IsRefInFrame()) {
       ceres::CostFunction* cost_function =
           BATAPairwiseDirectionError::Create(translation);
 
       problem_->AddResidualBlock(
           cost_function,
           loss_function,
-          image.frame_ptr->RigFromWorld().translation.data(),
-          tracks[track_id].xyz.data(),
+          image.FramePtr()->RigFromWorld().translation.data(),
+          track.xyz.data(),
           &scale);
       // If the image is part of a camera rig, use the RigBATA error
     } else {
-      rig_t rig_id = image.frame_ptr->RigId();
+      rig_t rig_id = image.FramePtr()->RigId();
       // Otherwise, use the camera rig translation from the frame
       Rigid3d& cam_from_rig = rigs.at(rig_id).SensorFromRig(
-          sensor_t(SensorType::CAMERA, image.camera_id));
+          sensor_t(SensorType::CAMERA, image.CameraId()));
 
       Eigen::Vector3d cam_from_rig_translation = cam_from_rig.translation;
 
       if (!cam_from_rig_translation.hasNaN()) {
         const Eigen::Vector3d translation_rig =
-            // image.cam_from_world.rotation.inverse() *
-            // cam_from_rig.translation;
             image.CamFromWorld().rotation.inverse() * cam_from_rig_translation;
 
         ceres::CostFunction* cost_function =
@@ -348,8 +354,8 @@ void GlobalPositioner::AddTrackToProblem(
         problem_->AddResidualBlock(
             cost_function,
             loss_function,
-            image.frame_ptr->RigFromWorld().translation.data(),
-            tracks[track_id].xyz.data(),
+            image.FramePtr()->RigFromWorld().translation.data(),
+            track.xyz.data(),
             &scale,
             &rig_scales_[rig_id]);
       } else {
@@ -359,13 +365,13 @@ void GlobalPositioner::AddTrackToProblem(
         // global one
         ceres::CostFunction* cost_function =
             RigUnknownBATAPairwiseDirectionError::Create(
-                translation, image.frame_ptr->RigFromWorld().rotation);
+                translation, image.FramePtr()->RigFromWorld().rotation);
 
         problem_->AddResidualBlock(
             cost_function,
             loss_function,
-            tracks[track_id].xyz.data(),
-            image.frame_ptr->RigFromWorld().translation.data(),
+            track.xyz.data(),
+            image.FramePtr()->RigFromWorld().translation.data(),
             cam_from_rig.translation.data(),
             &scale);
       }
@@ -379,7 +385,7 @@ void GlobalPositioner::AddCamerasAndPointsToParameterGroups(
     // std::unordered_map<image_t, Image>& images,
     std::unordered_map<rig_t, Rig>& rigs,
     std::unordered_map<frame_t, Frame>& frames,
-    std::unordered_map<track_t, Track>& tracks) {
+    std::unordered_map<point3D_t, Point3D>& tracks) {
   // Create a custom ordering for Schur-based problems.
   options_.solver_options.linear_solver_ordering.reset(
       new ceres::ParameterBlockOrdering);
@@ -434,7 +440,7 @@ void GlobalPositioner::ParameterizeVariables(
     // std::unordered_map<image_t, Image>& images,
     std::unordered_map<rig_t, Rig>& rigs,
     std::unordered_map<frame_t, Frame>& frames,
-    std::unordered_map<track_t, Track>& tracks) {
+    std::unordered_map<point3D_t, Point3D>& tracks) {
   // For the global positioning, do not set any camera to be constant for easier
   // convergence
 
@@ -497,8 +503,8 @@ void GlobalPositioner::ParameterizeVariables(
     }
   }
 
-  int num_images = frames.size();
 #ifdef GLOMAP_CUDA_ENABLED
+  const int num_images = frames.size();
   bool cuda_solver_enabled = false;
 
 #if (CERES_VERSION_MAJOR >= 3 ||                                \
@@ -560,29 +566,26 @@ void GlobalPositioner::ParameterizeVariables(
   }
 }
 
-void GlobalPositioner::ConvertResults(
+void GlobalPositioner::ConvertBackResults(
     std::unordered_map<rig_t, Rig>& rigs,
     std::unordered_map<frame_t, Frame>& frames) {
-  // translation now stores the camera position, needs to convert back
+  // Translations store the frame/camera centers. Convert them back
+  // and apply the rig scales.
+
   for (auto& [frame_id, frame] : frames) {
     frame.RigFromWorld().translation =
-        -(frame.RigFromWorld().rotation * frame.RigFromWorld().translation);
-
-    rig_t idx_rig = frame.RigId();
-    frame.RigFromWorld().translation *= rig_scales_[idx_rig];
+        frame.RigFromWorld().rotation * -frame.RigFromWorld().translation;
+    frame.RigFromWorld().translation *= rig_scales_[frame.RigId()];
   }
 
-  // Update the rig scales
   for (auto& [rig_id, rig] : rigs) {
     for (auto& [sensor_id, cam_from_rig] : rig.NonRefSensors()) {
       if (cam_from_rig.has_value()) {
         if (problem_->HasParameterBlock(
                 rig.SensorFromRig(sensor_id).translation.data())) {
           cam_from_rig->translation =
-              -(cam_from_rig->rotation * cam_from_rig->translation);
+              cam_from_rig->rotation * -cam_from_rig->translation;
         } else {
-          // If the camera is part of a rig, then scale the translation
-          // by the rig scale
           cam_from_rig->translation *= rig_scales_[rig_id];
         }
       }

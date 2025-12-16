@@ -3,25 +3,26 @@
 #include "glomap/processors/view_graph_manipulation.h"
 
 namespace glomap {
-image_t PruneWeaklyConnectedImages(std::unordered_map<frame_t, Frame>& frames,
-                                   std::unordered_map<image_t, Image>& images,
-                                   std::unordered_map<track_t, Track>& tracks,
-                                   int min_num_images,
-                                   int min_num_observations) {
+image_t PruneWeaklyConnectedImages(
+    std::unordered_map<frame_t, Frame>& frames,
+    std::unordered_map<image_t, Image>& images,
+    std::unordered_map<point3D_t, Point3D>& tracks,
+    int min_num_images,
+    int min_num_observations) {
   // Prepare the 2d-3d correspondences
   std::unordered_map<image_pair_t, int> pair_covisibility_count;
   std::unordered_map<frame_t, int> frame_observation_count;
   for (auto& [track_id, track] : tracks) {
-    if (track.observations.size() <= 2) continue;
+    if (track.track.Length() <= 2) continue;
 
-    for (size_t i = 0; i < track.observations.size(); i++) {
-      image_t image_id1 = track.observations[i].first;
-      frame_t frame_id1 = images[image_id1].frame_id;
+    for (size_t i = 0; i < track.track.Length(); i++) {
+      const image_t image_id1 = track.track.Element(i).image_id;
+      const frame_t frame_id1 = images[image_id1].FrameId();
 
       frame_observation_count[frame_id1]++;
-      for (size_t j = i + 1; j < track.observations.size(); j++) {
-        image_t image_id2 = track.observations[j].first;
-        frame_t frame_id2 = images[image_id2].frame_id;
+      for (size_t j = i + 1; j < track.track.Length(); j++) {
+        const image_t image_id2 = track.track.Element(j).image_id;
+        const frame_t frame_id2 = images[image_id2].FrameId();
         if (frame_id1 == frame_id2) continue;
         const image_pair_t pair_id =
             colmap::ImagePairToPairId(frame_id1, frame_id2);

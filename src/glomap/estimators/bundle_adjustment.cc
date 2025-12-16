@@ -13,7 +13,7 @@ bool BundleAdjuster::Solve(
     std::unordered_map<camera_t, colmap::Camera>& cameras,
     std::unordered_map<frame_t, Frame>& frames,
     std::unordered_map<image_t, Image>& images,
-    std::unordered_map<track_t, Track>& tracks) {
+    std::unordered_map<point3D_t, Point3D>& tracks) {
   // Check if the input data is valid
   if (images.empty()) {
     LOG(ERROR) << "Number of images = " << images.size();
@@ -40,7 +40,6 @@ bool BundleAdjuster::Solve(
   // Set the solver options.
   ceres::Solver::Summary summary;
 
-  int num_images = images.size();
 #ifdef GLOMAP_CUDA_ENABLED
   bool cuda_solver_enabled = false;
 
@@ -118,73 +117,72 @@ void BundleAdjuster::AddPointToCameraConstraints(
     std::unordered_map<camera_t, colmap::Camera>& cameras,
     std::unordered_map<frame_t, Frame>& frames,
     std::unordered_map<image_t, Image>& images,
-    std::unordered_map<track_t, Track>& tracks) {
+    std::unordered_map<point3D_t, Point3D>& tracks) {
   for (auto& [track_id, track] : tracks) {
-    if (track.observations.size() < options_.min_num_view_per_track) continue;
+    if (track.track.Length() < options_.min_num_view_per_track) continue;
 
-    for (const auto& observation : tracks[track_id].observations) {
-      if (images.find(observation.first) == images.end()) continue;
+    for (const auto& observation : tracks[track_id].track.Elements()) {
+      if (images.find(observation.image_id) == images.end()) continue;
 
-      Image& image = images[observation.first];
-      Frame* frame_ptr = image.frame_ptr;
-      camera_t camera_id = image.camera_id;
-      image_t rig_id = image.frame_ptr->RigId();
+      Image& image = images[observation.image_id];
+      colmap::Frame* frame = image.FramePtr();
+      const image_t rig_id = frame->RigId();
 
       ceres::CostFunction* cost_function = nullptr;
       // if (image_id_to_camera_rig_index_.find(observation.first) ==
       //     image_id_to_camera_rig_index_.end()) {
-      if (image.HasTrivialFrame()) {
+      if (image.IsRefInFrame()) {
         cost_function =
             colmap::CreateCameraCostFunction<colmap::ReprojErrorCostFunctor>(
-                cameras[image.camera_id].model_id,
-                image.features[observation.second]);
+                cameras[image.CameraId()].model_id,
+                image.features[observation.point2D_idx]);
         problem_->AddResidualBlock(
             cost_function,
             loss_function_.get(),
-            frame_ptr->RigFromWorld().rotation.coeffs().data(),
-            frame_ptr->RigFromWorld().translation.data(),
+            frame->RigFromWorld().rotation.coeffs().data(),
+            frame->RigFromWorld().translation.data(),
             tracks[track_id].xyz.data(),
-            cameras[image.camera_id].params.data());
+            cameras[image.CameraId()].params.data());
       } else if (!options_.optimize_rig_poses) {
         const Rigid3d& cam_from_rig = rigs[rig_id].SensorFromRig(
-            sensor_t(SensorType::CAMERA, image.camera_id));
+            sensor_t(SensorType::CAMERA, image.CameraId()));
         cost_function = colmap::CreateCameraCostFunction<
             colmap::RigReprojErrorConstantRigCostFunctor>(
-            cameras[image.camera_id].model_id,
-            image.features[observation.second],
+            cameras[image.CameraId()].model_id,
+            image.features[observation.point2D_idx],
             cam_from_rig);
         problem_->AddResidualBlock(
             cost_function,
             loss_function_.get(),
-            frame_ptr->RigFromWorld().rotation.coeffs().data(),
-            frame_ptr->RigFromWorld().translation.data(),
+            frame->RigFromWorld().rotation.coeffs().data(),
+            frame->RigFromWorld().translation.data(),
             tracks[track_id].xyz.data(),
-            cameras[image.camera_id].params.data());
+            cameras[image.CameraId()].params.data());
       } else {
         // If the image is part of a camera rig, use the RigBATA error
         // Down weight the uncalibrated cameras
         Rigid3d& cam_from_rig = rigs[rig_id].SensorFromRig(
-            sensor_t(SensorType::CAMERA, image.camera_id));
+            sensor_t(SensorType::CAMERA, image.CameraId()));
         cost_function =
             colmap::CreateCameraCostFunction<colmap::RigReprojErrorCostFunctor>(
-                cameras[image.camera_id].model_id,
-                image.features[observation.second]);
+                cameras[image.CameraId()].model_id,
+                image.features[observation.point2D_idx]);
         problem_->AddResidualBlock(
             cost_function,
             loss_function_.get(),
             cam_from_rig.rotation.coeffs().data(),
             cam_from_rig.translation.data(),
-            frame_ptr->RigFromWorld().rotation.coeffs().data(),
-            frame_ptr->RigFromWorld().translation.data(),
+            frame->RigFromWorld().rotation.coeffs().data(),
+            frame->RigFromWorld().translation.data(),
             tracks[track_id].xyz.data(),
-            cameras[image.camera_id].params.data());
+            cameras[image.CameraId()].params.data());
       }
 
       if (cost_function != nullptr) {
       } else {
         LOG(ERROR) << "Camera model not supported: "
                    << colmap::CameraModelIdToName(
-                          cameras[image.camera_id].model_id);
+                          cameras[image.CameraId()].model_id);
       }
     }
   }
@@ -194,7 +192,7 @@ void BundleAdjuster::AddCamerasAndPointsToParameterGroups(
     std::unordered_map<rig_t, Rig>& rigs,
     std::unordered_map<camera_t, colmap::Camera>& cameras,
     std::unordered_map<frame_t, Frame>& frames,
-    std::unordered_map<track_t, Track>& tracks) {
+    std::unordered_map<point3D_t, Point3D>& tracks) {
   if (tracks.size() == 0) return;
 
   // Create a custom ordering for Schur-based problems.
@@ -246,7 +244,7 @@ void BundleAdjuster::ParameterizeVariables(
     std::unordered_map<rig_t, Rig>& rigs,
     std::unordered_map<camera_t, colmap::Camera>& cameras,
     std::unordered_map<frame_t, Frame>& frames,
-    std::unordered_map<track_t, Track>& tracks) {
+    std::unordered_map<point3D_t, Point3D>& tracks) {
   frame_t center;
 
   // Parameterize rotations, and set rotations and translations to be constant

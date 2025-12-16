@@ -7,7 +7,7 @@ colmap::Sim3d NormalizeReconstruction(
     std::unordered_map<camera_t, colmap::Camera>& cameras,
     std::unordered_map<frame_t, Frame>& frames,
     std::unordered_map<image_t, Image>& images,
-    std::unordered_map<track_t, Track>& tracks,
+    std::unordered_map<point3D_t, Point3D>& tracks,
     bool fixed_scale,
     double extent,
     double p0,
@@ -21,8 +21,8 @@ colmap::Sim3d NormalizeReconstruction(
   coords_y.reserve(images.size());
   coords_z.reserve(images.size());
   for (const auto& [image_id, image] : images) {
-    if (!image.IsRegistered()) continue;
-    const Eigen::Vector3d proj_center = image.Center();
+    if (!image.HasPose()) continue;
+    const Eigen::Vector3d proj_center = image.ProjectionCenter();
     coords_x.push_back(static_cast<float>(proj_center(0)));
     coords_y.push_back(static_cast<float>(proj_center(1)));
     coords_z.push_back(static_cast<float>(proj_center(2)));

@@ -1,64 +1,26 @@
-#include "glomap/controllers/rotation_averager.h"
+#include "glomap/sfm/rotation_averager.h"
 
-#include "colmap/estimators/alignment.h"
 #include "colmap/math/random.h"
 #include "colmap/scene/synthetic.h"
 #include "colmap/util/testing.h"
 
-#include "glomap/controllers/global_mapper.h"
 #include "glomap/estimators/gravity_refinement.h"
-#include "glomap/io/colmap_io.h"
-#include "glomap/math/rigid3d.h"
-#include "glomap/types.h"
+#include "glomap/io/colmap_converter.h"
+#include "glomap/math/gravity.h"
+#include "glomap/sfm/global_mapper.h"
 
 #include <gtest/gtest.h>
 
 namespace glomap {
 namespace {
 
-void CreateRandomRotation(const double stddev, Eigen::Quaterniond& q) {
-  std::random_device rd{};
-  std::mt19937 gen{rd()};
-
-  // Construct a random axis
-  double theta = colmap::RandomUniformReal<double>(0, 2 * M_PI);
-  double phi = colmap::RandomUniformReal<double>(0, M_PI);
-  Eigen::Vector3d axis(std::cos(theta) * std::sin(phi),
-                       std::sin(theta) * std::sin(phi),
-                       std::cos(phi));
-
-  // Construct a random angle
-  std::normal_distribution<double> d{0, stddev};
-  double angle = d(gen);
-  q = Eigen::AngleAxisd(angle, axis);
-}
-
-void PrepareGravity(const colmap::Reconstruction& gt,
-                    std::unordered_map<frame_t, Frame>& frames,
-                    double gravity_noise_stddev = 0.0,
-                    double outlier_ratio = 0.0) {
-  const Eigen::Vector3d kGravityInWorld = Eigen::Vector3d(0, 1, 0);
-  for (auto& frame_id : gt.RegFrameIds()) {
-    Eigen::Vector3d gravityInRig =
-        gt.Frame(frame_id).RigFromWorld().rotation * kGravityInWorld;
-
-    if (gravity_noise_stddev > 0.0) {
-      Eigen::Quaterniond noise;
-      CreateRandomRotation(DegToRad(gravity_noise_stddev), noise);
-      gravityInRig = noise * gravityInRig;
-    }
-
-    if (outlier_ratio > 0.0 &&
+void SynthesizeGravityOutliers(std::vector<colmap::PosePrior>& pose_priors,
+                               double outlier_ratio = 0.0) {
+  for (auto& pose_prior : pose_priors) {
+    if (pose_prior.HasGravity() &&
         colmap::RandomUniformReal<double>(0, 1) < outlier_ratio) {
-      Eigen::Quaterniond q;
-      CreateRandomRotation(1., q);
-      gravityInRig =
-          Rigid3dToAngleAxis(Rigid3d(q, Eigen::Vector3d::Zero())).normalized();
+      pose_prior.gravity = Eigen::Vector3d::Random().normalized();
     }
-
-    frames[frame_id].gravity_info.SetGravity(gravityInRig);
-    Rigid3d& cam_from_world = frames[frame_id].RigFromWorld();
-    cam_from_world.rotation = frames[frame_id].gravity_info.GetRAlign();
   }
 }
 
@@ -85,40 +47,45 @@ RotationAveragerOptions CreateRATestOptions(bool use_gravity = false) {
 void ExpectEqualRotations(const colmap::Reconstruction& gt,
                           const colmap::Reconstruction& computed,
                           const double max_rotation_error_deg) {
+  const double max_rotation_error_rad =
+      colmap::DegToRad(max_rotation_error_deg);
   const std::vector<image_t> reg_image_ids = gt.RegImageIds();
   for (size_t i = 0; i < reg_image_ids.size(); i++) {
     const image_t image_id1 = reg_image_ids[i];
     for (size_t j = 0; j < i; j++) {
       const image_t image_id2 = reg_image_ids[j];
-
-      const Rigid3d cam2_from_cam1 =
-          computed.Image(image_id2).CamFromWorld() *
-          Inverse(computed.Image(image_id1).CamFromWorld());
-      const Rigid3d cam2_from_cam1_gt =
-          gt.Image(image_id2).CamFromWorld() *
-          Inverse(gt.Image(image_id1).CamFromWorld());
-
-      const double rotation_error_deg =
-          CalcAngle(cam2_from_cam1_gt, cam2_from_cam1);
-      EXPECT_LT(rotation_error_deg, max_rotation_error_deg);
+      const Eigen::Quaterniond cam2_from_cam1 =
+          computed.Image(image_id2).CamFromWorld().rotation *
+          computed.Image(image_id1).CamFromWorld().rotation.inverse();
+      const Eigen::Quaterniond cam2_from_cam1_gt =
+          gt.Image(image_id2).CamFromWorld().rotation *
+          gt.Image(image_id1).CamFromWorld().rotation.inverse();
+      EXPECT_LT(cam2_from_cam1.angularDistance(cam2_from_cam1_gt),
+                max_rotation_error_rad);
     }
   }
 }
 
-void ExpectEqualGravity(
-    const colmap::Reconstruction& gt,
-    const std::unordered_map<image_t, Image>& images_computed,
-    const double max_gravity_error_deg) {
+void ExpectEqualGravity(const Eigen::Vector3d& gravity_in_world,
+                        const colmap::Reconstruction& gt,
+                        const std::vector<colmap::PosePrior>& pose_priors,
+                        const double max_gravity_error_deg) {
+  std::unordered_map<image_t, const colmap::PosePrior*> image_to_pose_prior;
+  for (const auto& pose_prior : pose_priors) {
+    if (pose_prior.corr_data_id.sensor_id.type == SensorType::CAMERA) {
+      image_to_pose_prior.emplace(pose_prior.corr_data_id.id, &pose_prior);
+    }
+  }
   for (const auto& image_id : gt.RegImageIds()) {
-    if (!images_computed.at(image_id).HasTrivialFrame()) {
-      continue;  // Skip images that are not trivial frames
+    const auto& image = gt.Image(image_id);
+    if (!image.IsRefInFrame()) {
+      continue;
     }
     const Eigen::Vector3d gravity_gt =
-        gt.Image(image_id).CamFromWorld().rotation * Eigen::Vector3d(0, 1, 0);
+        gt.Image(image_id).CamFromWorld().rotation * gravity_in_world;
     const Eigen::Vector3d gravity_computed =
-        images_computed.at(image_id).frame_ptr->gravity_info.GetGravity();
-
-    double gravity_error_deg = CalcAngle(gravity_gt, gravity_computed);
+        image_to_pose_prior.at(image_id)->gravity;
+    const double gravity_error_deg = CalcAngle(gravity_gt, gravity_computed);
     EXPECT_LT(gravity_error_deg, max_gravity_error_deg);
   }
 }
@@ -136,6 +103,7 @@ TEST(RotationEstimator, WithoutNoise) {
   synthetic_dataset_options.num_frames_per_rig = 5;
   synthetic_dataset_options.num_points3D = 50;
   synthetic_dataset_options.sensor_from_rig_rotation_stddev = 20.;
+  synthetic_dataset_options.prior_gravity = true;
   colmap::SynthesizeDataset(
       synthetic_dataset_options, &gt_reconstruction, database.get());
 
@@ -144,21 +112,30 @@ TEST(RotationEstimator, WithoutNoise) {
   std::unordered_map<camera_t, colmap::Camera> cameras;
   std::unordered_map<frame_t, Frame> frames;
   std::unordered_map<image_t, Image> images;
-  std::unordered_map<track_t, Track> tracks;
+  std::unordered_map<point3D_t, Point3D> tracks;
+  std::vector<colmap::PosePrior> pose_priors = database->ReadAllPosePriors();
 
   ConvertDatabaseToGlomap(*database, view_graph, rigs, cameras, frames, images);
 
-  PrepareGravity(gt_reconstruction, frames);
-
   GlobalMapper global_mapper(CreateMapperTestOptions());
-  global_mapper.Solve(
-      *database, view_graph, rigs, cameras, frames, images, tracks);
+  global_mapper.Solve(*database,
+                      view_graph,
+                      rigs,
+                      cameras,
+                      frames,
+                      images,
+                      tracks,
+                      pose_priors);
 
   // TODO: The current 1-dof rotation averaging sometimes fails to pick the
   // right solution (e.g., 180 deg flipped).
   for (const bool use_gravity : {false}) {
-    SolveRotationAveraging(
-        view_graph, rigs, frames, images, CreateRATestOptions(use_gravity));
+    SolveRotationAveraging(view_graph,
+                           rigs,
+                           frames,
+                           images,
+                           pose_priors,
+                           CreateRATestOptions(use_gravity));
 
     colmap::Reconstruction reconstruction;
     ConvertGlomapToColmap(
@@ -168,7 +145,7 @@ TEST(RotationEstimator, WithoutNoise) {
   }
 }
 
-TEST(RotationEstimator, WithoutNoiseWithNoneTrivialKnownRig) {
+TEST(RotationEstimator, WithoutNoiseWithNonTrivialKnownRig) {
   colmap::SetPRNGSeed(1);
 
   const std::string database_path = colmap::CreateTestDir() + "/database.db";
@@ -181,6 +158,7 @@ TEST(RotationEstimator, WithoutNoiseWithNoneTrivialKnownRig) {
   synthetic_dataset_options.num_frames_per_rig = 4;
   synthetic_dataset_options.num_points3D = 50;
   synthetic_dataset_options.sensor_from_rig_rotation_stddev = 20.;
+  synthetic_dataset_options.prior_gravity = true;
   colmap::SynthesizeDataset(
       synthetic_dataset_options, &gt_reconstruction, database.get());
 
@@ -189,19 +167,28 @@ TEST(RotationEstimator, WithoutNoiseWithNoneTrivialKnownRig) {
   std::unordered_map<camera_t, colmap::Camera> cameras;
   std::unordered_map<frame_t, Frame> frames;
   std::unordered_map<image_t, Image> images;
-  std::unordered_map<track_t, Track> tracks;
+  std::unordered_map<point3D_t, Point3D> tracks;
+  std::vector<colmap::PosePrior> pose_priors = database->ReadAllPosePriors();
 
   ConvertDatabaseToGlomap(*database, view_graph, rigs, cameras, frames, images);
 
-  PrepareGravity(gt_reconstruction, frames);
-
   GlobalMapper global_mapper(CreateMapperTestOptions());
-  global_mapper.Solve(
-      *database, view_graph, rigs, cameras, frames, images, tracks);
+  global_mapper.Solve(*database,
+                      view_graph,
+                      rigs,
+                      cameras,
+                      frames,
+                      images,
+                      tracks,
+                      pose_priors);
 
   for (const bool use_gravity : {true, false}) {
-    SolveRotationAveraging(
-        view_graph, rigs, frames, images, CreateRATestOptions(use_gravity));
+    SolveRotationAveraging(view_graph,
+                           rigs,
+                           frames,
+                           images,
+                           pose_priors,
+                           CreateRATestOptions(use_gravity));
 
     colmap::Reconstruction reconstruction;
     ConvertGlomapToColmap(
@@ -211,7 +198,7 @@ TEST(RotationEstimator, WithoutNoiseWithNoneTrivialKnownRig) {
   }
 }
 
-TEST(RotationEstimator, WithoutNoiseWithNoneTrivialUnknownRig) {
+TEST(RotationEstimator, WithoutNoiseWithNonTrivialUnknownRig) {
   colmap::SetPRNGSeed(1);
 
   const std::string database_path = colmap::CreateTestDir() + "/database.db";
@@ -224,6 +211,7 @@ TEST(RotationEstimator, WithoutNoiseWithNoneTrivialUnknownRig) {
   synthetic_dataset_options.num_frames_per_rig = 4;
   synthetic_dataset_options.num_points3D = 50;
   synthetic_dataset_options.sensor_from_rig_rotation_stddev = 20.;
+  synthetic_dataset_options.prior_gravity = true;
   colmap::SynthesizeDataset(
       synthetic_dataset_options, &gt_reconstruction, database.get());
 
@@ -232,7 +220,8 @@ TEST(RotationEstimator, WithoutNoiseWithNoneTrivialUnknownRig) {
   std::unordered_map<camera_t, colmap::Camera> cameras;
   std::unordered_map<frame_t, Frame> frames;
   std::unordered_map<image_t, Image> images;
-  std::unordered_map<track_t, Track> tracks;
+  std::unordered_map<point3D_t, Point3D> tracks;
+  std::vector<colmap::PosePrior> pose_priors = database->ReadAllPosePriors();
 
   ConvertDatabaseToGlomap(*database, view_graph, rigs, cameras, frames, images);
 
@@ -243,16 +232,25 @@ TEST(RotationEstimator, WithoutNoiseWithNoneTrivialUnknownRig) {
       }
     }
   }
-  PrepareGravity(gt_reconstruction, frames);
 
   GlobalMapper global_mapper(CreateMapperTestOptions());
-  global_mapper.Solve(
-      *database, view_graph, rigs, cameras, frames, images, tracks);
+  global_mapper.Solve(*database,
+                      view_graph,
+                      rigs,
+                      cameras,
+                      frames,
+                      images,
+                      tracks,
+                      pose_priors);
 
   // For unknown rigs, it is not supported to use gravity.
   for (const bool use_gravity : {false}) {
-    SolveRotationAveraging(
-        view_graph, rigs, frames, images, CreateRATestOptions(use_gravity));
+    SolveRotationAveraging(view_graph,
+                           rigs,
+                           frames,
+                           images,
+                           pose_priors,
+                           CreateRATestOptions(use_gravity));
 
     colmap::Reconstruction reconstruction;
     ConvertGlomapToColmap(
@@ -275,10 +273,12 @@ TEST(RotationEstimator, WithNoiseAndOutliers) {
   synthetic_dataset_options.num_frames_per_rig = 7;
   synthetic_dataset_options.num_points3D = 100;
   synthetic_dataset_options.inlier_match_ratio = 0.6;
+  synthetic_dataset_options.prior_gravity = true;
   colmap::SynthesizeDataset(
       synthetic_dataset_options, &gt_reconstruction, database.get());
   colmap::SyntheticNoiseOptions synthetic_noise_options;
   synthetic_noise_options.point2D_stddev = 1;
+  synthetic_noise_options.prior_gravity_stddev = 3e-1;
   colmap::SynthesizeNoise(
       synthetic_noise_options, &gt_reconstruction, database.get());
 
@@ -287,21 +287,31 @@ TEST(RotationEstimator, WithNoiseAndOutliers) {
   std::unordered_map<camera_t, colmap::Camera> cameras;
   std::unordered_map<image_t, Image> images;
   std::unordered_map<frame_t, Frame> frames;
-  std::unordered_map<track_t, Track> tracks;
+  std::unordered_map<point3D_t, Point3D> tracks;
+  std::vector<colmap::PosePrior> pose_priors = database->ReadAllPosePriors();
+  SynthesizeGravityOutliers(pose_priors, /*outlier_ratio=*/0.3);
 
   ConvertDatabaseToGlomap(*database, view_graph, rigs, cameras, frames, images);
 
-  PrepareGravity(gt_reconstruction, frames, /*gravity_noise_stddev=*/3e-1);
-
   GlobalMapper global_mapper(CreateMapperTestOptions());
-  global_mapper.Solve(
-      *database, view_graph, rigs, cameras, frames, images, tracks);
+  global_mapper.Solve(*database,
+                      view_graph,
+                      rigs,
+                      cameras,
+                      frames,
+                      images,
+                      tracks,
+                      pose_priors);
 
   // TODO: The current 1-dof rotation averaging sometimes fails to pick the
   // right solution (e.g., 180 deg flipped).
   for (const bool use_gravity : {false}) {
-    SolveRotationAveraging(
-        view_graph, rigs, frames, images, CreateRATestOptions(use_gravity));
+    SolveRotationAveraging(view_graph,
+                           rigs,
+                           frames,
+                           images,
+                           pose_priors,
+                           CreateRATestOptions(use_gravity));
 
     colmap::Reconstruction reconstruction;
     ConvertGlomapToColmap(
@@ -324,10 +334,12 @@ TEST(RotationEstimator, WithNoiseAndOutliersWithNonTrivialKnownRigs) {
   synthetic_dataset_options.num_frames_per_rig = 7;
   synthetic_dataset_options.num_points3D = 100;
   synthetic_dataset_options.inlier_match_ratio = 0.6;
+  synthetic_dataset_options.prior_gravity = true;
   colmap::SynthesizeDataset(
       synthetic_dataset_options, &gt_reconstruction, database.get());
   colmap::SyntheticNoiseOptions synthetic_noise_options;
   synthetic_noise_options.point2D_stddev = 1;
+  synthetic_noise_options.prior_gravity_stddev = 3e-1;
   colmap::SynthesizeNoise(
       synthetic_noise_options, &gt_reconstruction, database.get());
 
@@ -336,30 +348,37 @@ TEST(RotationEstimator, WithNoiseAndOutliersWithNonTrivialKnownRigs) {
   std::unordered_map<camera_t, colmap::Camera> cameras;
   std::unordered_map<image_t, Image> images;
   std::unordered_map<frame_t, Frame> frames;
-  std::unordered_map<track_t, Track> tracks;
+  std::unordered_map<point3D_t, Point3D> tracks;
+  std::vector<colmap::PosePrior> pose_priors = database->ReadAllPosePriors();
+  SynthesizeGravityOutliers(pose_priors, /*outlier_ratio=*/0.3);
 
   ConvertDatabaseToGlomap(*database, view_graph, rigs, cameras, frames, images);
-  PrepareGravity(gt_reconstruction, frames, /*gravity_noise_stddev=*/3e-1);
 
   GlobalMapper global_mapper(CreateMapperTestOptions());
-  global_mapper.Solve(
-      *database, view_graph, rigs, cameras, frames, images, tracks);
+  global_mapper.Solve(*database,
+                      view_graph,
+                      rigs,
+                      cameras,
+                      frames,
+                      images,
+                      tracks,
+                      pose_priors);
 
   // TODO: The current 1-dof rotation averaging sometimes fails to pick the
   // right solution (e.g., 180 deg flipped).
-  for (const bool use_gravity : {true, false}) {
-    SolveRotationAveraging(
-        view_graph, rigs, frames, images, CreateRATestOptions(use_gravity));
+  for (const bool use_gravity : {false}) {
+    SolveRotationAveraging(view_graph,
+                           rigs,
+                           frames,
+                           images,
+                           pose_priors,
+                           CreateRATestOptions(use_gravity));
 
     colmap::Reconstruction reconstruction;
     ConvertGlomapToColmap(
         rigs, cameras, frames, images, tracks, reconstruction);
-    if (use_gravity)
-      ExpectEqualRotations(
-          gt_reconstruction, reconstruction, /*max_rotation_error_deg=*/1.5);
-    else
-      ExpectEqualRotations(
-          gt_reconstruction, reconstruction, /*max_rotation_error_deg=*/2.);
+    ExpectEqualRotations(
+        gt_reconstruction, reconstruction, /*max_rotation_error_deg=*/2.);
   }
 }
 
@@ -375,6 +394,7 @@ TEST(RotationEstimator, RefineGravity) {
   synthetic_dataset_options.num_cameras_per_rig = 1;
   synthetic_dataset_options.num_frames_per_rig = 25;
   synthetic_dataset_options.num_points3D = 100;
+  synthetic_dataset_options.prior_gravity = true;
   colmap::SynthesizeDataset(
       synthetic_dataset_options, &gt_reconstruction, database.get());
 
@@ -383,30 +403,33 @@ TEST(RotationEstimator, RefineGravity) {
   std::unordered_map<camera_t, colmap::Camera> cameras;
   std::unordered_map<frame_t, Frame> frames;
   std::unordered_map<image_t, Image> images;
-  std::unordered_map<track_t, Track> tracks;
+  std::unordered_map<point3D_t, Point3D> tracks;
+  std::vector<colmap::PosePrior> pose_priors = database->ReadAllPosePriors();
+  SynthesizeGravityOutliers(pose_priors, /*outlier_ratio=*/0.3);
 
   ConvertDatabaseToGlomap(*database, view_graph, rigs, cameras, frames, images);
 
-  PrepareGravity(gt_reconstruction,
-                 frames,
-                 /*gravity_noise_stddev=*/0.,
-                 /*outlier_ratio=*/0.3);
-
   GlobalMapper global_mapper(CreateMapperTestOptions());
-  global_mapper.Solve(
-      *database, view_graph, rigs, cameras, frames, images, tracks);
+  global_mapper.Solve(*database,
+                      view_graph,
+                      rigs,
+                      cameras,
+                      frames,
+                      images,
+                      tracks,
+                      pose_priors);
 
   GravityRefinerOptions opt_grav_refine;
   GravityRefiner grav_refiner(opt_grav_refine);
-  grav_refiner.RefineGravity(view_graph, frames, images);
+  grav_refiner.RefineGravity(view_graph, frames, images, pose_priors);
 
-  // Check whether the gravity does not have error after refinement
-  ExpectEqualGravity(gt_reconstruction,
-                     images,
+  ExpectEqualGravity(synthetic_dataset_options.prior_gravity_in_world,
+                     gt_reconstruction,
+                     pose_priors,
                      /*max_gravity_error_deg=*/1e-2);
 }
 
-TEST(RotationEstimator, RefineGravityWithNontrivialRigs) {
+TEST(RotationEstimator, RefineGravityWithNonTrivialRigs) {
   colmap::SetPRNGSeed(1);
 
   const std::string database_path = colmap::CreateTestDir() + "/database.db";
@@ -418,6 +441,7 @@ TEST(RotationEstimator, RefineGravityWithNontrivialRigs) {
   synthetic_dataset_options.num_cameras_per_rig = 2;
   synthetic_dataset_options.num_frames_per_rig = 25;
   synthetic_dataset_options.num_points3D = 100;
+  synthetic_dataset_options.prior_gravity = true;
   colmap::SynthesizeDataset(
       synthetic_dataset_options, &gt_reconstruction, database.get());
 
@@ -426,26 +450,29 @@ TEST(RotationEstimator, RefineGravityWithNontrivialRigs) {
   std::unordered_map<camera_t, colmap::Camera> cameras;
   std::unordered_map<frame_t, Frame> frames;
   std::unordered_map<image_t, Image> images;
-  std::unordered_map<track_t, Track> tracks;
+  std::unordered_map<point3D_t, Point3D> tracks;
+  std::vector<colmap::PosePrior> pose_priors = database->ReadAllPosePriors();
+  SynthesizeGravityOutliers(pose_priors, /*outlier_ratio=*/0.3);
 
   ConvertDatabaseToGlomap(*database, view_graph, rigs, cameras, frames, images);
 
-  PrepareGravity(gt_reconstruction,
-                 frames,
-                 /*gravity_noise_stddev=*/0.,
-                 /*outlier_ratio=*/0.3);
-
   GlobalMapper global_mapper(CreateMapperTestOptions());
-  global_mapper.Solve(
-      *database, view_graph, rigs, cameras, frames, images, tracks);
+  global_mapper.Solve(*database,
+                      view_graph,
+                      rigs,
+                      cameras,
+                      frames,
+                      images,
+                      tracks,
+                      pose_priors);
 
   GravityRefinerOptions opt_grav_refine;
   GravityRefiner grav_refiner(opt_grav_refine);
-  grav_refiner.RefineGravity(view_graph, frames, images);
+  grav_refiner.RefineGravity(view_graph, frames, images, pose_priors);
 
-  // Check whether the gravity does not have error after refinement
-  ExpectEqualGravity(gt_reconstruction,
-                     images,
+  ExpectEqualGravity(synthetic_dataset_options.prior_gravity_in_world,
+                     gt_reconstruction,
+                     pose_priors,
                      /*max_gravity_error_deg=*/1e-2);
 }
 

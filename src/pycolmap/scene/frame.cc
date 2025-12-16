@@ -35,10 +35,23 @@ void BindFrame(py::module& m) {
       .def("has_data",
            &Frame::HasDataId,
            "Check whether frame has associated data.")
+      .def("clear_data_ids",
+           &Frame::ClearDataIds,
+           "Clear all the associated data.")
       .def_property_readonly(
           "data_ids",
           [](const Frame& self) { return self.DataIds(); },
           "The associated data.")
+      // Cannot have the same name as the property "data_ids" above due to
+      // pybind11 limitations.
+      .def(
+          "data_ids_by_sensor",
+          [](const Frame& self, SensorType type) {
+            const auto data_ids = self.DataIds(type);
+            return std::vector<data_t>(data_ids.begin(), data_ids.end());
+          },
+          "type"_a,
+          "The associated data for a given sensor type.")
       .def_property_readonly(
           "image_ids",
           [](const Frame& self) {
