@@ -34,6 +34,8 @@
 #include "colmap/util/file.h"
 #include "colmap/util/testing.h"
 
+#include <filesystem>
+
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
@@ -47,11 +49,11 @@ class ParameterizedWorkspaceTests
  protected:
   void SetUp() override {
     temp_dir_ = CreateTestDir();
-    CreateDirIfNotExists(JoinPaths(temp_dir_, "sparse"));
-    CreateDirIfNotExists(JoinPaths(temp_dir_, "images"));
-    CreateDirIfNotExists(JoinPaths(temp_dir_, "stereo"));
-    CreateDirIfNotExists(JoinPaths(temp_dir_, "stereo", "depth_maps"));
-    CreateDirIfNotExists(JoinPaths(temp_dir_, "stereo", "normal_maps"));
+    CreateDirIfNotExists(temp_dir_ / "sparse");
+    CreateDirIfNotExists(temp_dir_ / "images");
+    CreateDirIfNotExists(temp_dir_ / "stereo");
+    CreateDirIfNotExists(temp_dir_ / "stereo" / "depth_maps");
+    CreateDirIfNotExists(temp_dir_ / "stereo" / "normal_maps");
 
     SyntheticDatasetOptions options;
     options.num_rigs = 1;
@@ -61,23 +63,23 @@ class ParameterizedWorkspaceTests
     options.camera_height = 5;
     Reconstruction reconstruction;
     SynthesizeDataset(options, &reconstruction);
-    reconstruction.Write(JoinPaths(temp_dir_, "sparse"));
+    reconstruction.Write(temp_dir_ / "sparse");
 
     image_name_ = reconstruction.Image(1).Name();
 
     Mat<float> depth_map(options.camera_width, options.camera_height, 1);
     depth_map.Fill(1.0f);
-    depth_map.Write(JoinPaths(
-        temp_dir_, "stereo", "depth_maps", image_name_ + ".geometric.bin"));
+    depth_map.Write(temp_dir_ / "stereo" / "depth_maps" /
+                    (image_name_ + ".geometric.bin"));
 
     Mat<float> normal_map(options.camera_width, options.camera_height, 3);
     normal_map.Fill(1.0f);
-    normal_map.Write(JoinPaths(
-        temp_dir_, "stereo", "normal_maps", image_name_ + ".geometric.bin"));
+    normal_map.Write(temp_dir_ / "stereo" / "normal_maps" /
+                     (image_name_ + ".geometric.bin"));
 
     Bitmap bitmap(options.camera_width, options.camera_height, true);
     bitmap.Fill(BitmapColor<uint8_t>(0, 0, 0));
-    bitmap.Write(JoinPaths(temp_dir_, "images", image_name_));
+    bitmap.Write(temp_dir_ / "images" / image_name_);
   }
 
   Workspace::Options GetOptions() {
@@ -88,7 +90,7 @@ class ParameterizedWorkspaceTests
     return options;
   }
 
-  std::string temp_dir_;
+  std::filesystem::path temp_dir_;
   std::string image_name_;
 };
 
@@ -96,21 +98,35 @@ TEST_P(ParameterizedWorkspaceTests, GetData) {
   auto workspace = GetParam()(GetOptions());
   const auto& model = workspace->GetModel();
   EXPECT_EQ(model.images.size(), 1);
+  workspace->Load({image_name_});
   EXPECT_TRUE(workspace->HasBitmap(0));
-  EXPECT_THAT(workspace->GetBitmapPath(0), testing::HasSubstr(image_name_));
+  EXPECT_THAT(workspace->GetBitmapPath(0).string(),
+              testing::HasSubstr(image_name_));
+  EXPECT_FALSE(workspace->GetBitmap(0).IsEmpty());
   EXPECT_TRUE(workspace->HasDepthMap(0));
-  EXPECT_THAT(workspace->GetDepthMapPath(0), testing::HasSubstr(image_name_));
+  EXPECT_THAT(workspace->GetDepthMapPath(0).string(),
+              testing::HasSubstr(image_name_));
+  EXPECT_GT(workspace->GetDepthMap(0).GetNumBytes(), 0);
   EXPECT_TRUE(workspace->HasNormalMap(0));
-  EXPECT_THAT(workspace->GetNormalMapPath(0), testing::HasSubstr(image_name_));
+  EXPECT_THAT(workspace->GetNormalMapPath(0).string(),
+              testing::HasSubstr(image_name_));
+  EXPECT_GT(workspace->GetNormalMap(0).GetNumBytes(), 0);
 }
 
 TEST_P(ParameterizedWorkspaceTests, MaxImageSize) {
   Workspace::Options options = GetOptions();
   options.max_image_size = 4;
   auto workspace = GetParam()(options);
+  workspace->Load({image_name_});
   ASSERT_EQ(workspace->GetModel().images.size(), 1);
   EXPECT_EQ(workspace->GetModel().images[0].GetWidth(), 4);
   EXPECT_EQ(workspace->GetModel().images[0].GetHeight(), 2);
+  EXPECT_EQ(workspace->GetBitmap(0).Width(), 4);
+  EXPECT_EQ(workspace->GetBitmap(0).Height(), 2);
+  EXPECT_EQ(workspace->GetDepthMap(0).GetWidth(), 4);
+  EXPECT_EQ(workspace->GetDepthMap(0).GetHeight(), 2);
+  EXPECT_EQ(workspace->GetNormalMap(0).GetWidth(), 4);
+  EXPECT_EQ(workspace->GetNormalMap(0).GetHeight(), 2);
 }
 
 TEST_P(ParameterizedWorkspaceTests, Load) {

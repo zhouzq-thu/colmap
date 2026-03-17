@@ -56,16 +56,18 @@ FeatureMatcherWorker::FeatureMatcherWorker(
       output_queue_(output_queue) {
   THROW_CHECK(matching_options_.Check());
 
-  if (matching_options_.use_gpu) {
-#if !defined(COLMAP_CUDA_ENABLED)
+  if (matching_options_.RequiresOpenGL()) {
     opengl_context_ = std::make_unique<OpenGLContextManager>();
-#endif
   }
 }
 
 void FeatureMatcherWorker::Run() {
-  if (matching_options_.use_gpu) {
+  if (opengl_context_ != nullptr) {
+    THROW_CHECK(opengl_context_->MakeCurrent());
+  }
+
 #if defined(COLMAP_CUDA_ENABLED)
+  if (matching_options_.use_gpu) {
     // Initialize CUDA device for this worker thread
     const std::vector<int> gpu_indices =
         CSVToVector<int>(matching_options_.gpu_index);
@@ -77,13 +79,10 @@ void FeatureMatcherWorker::Run() {
       SetBestCudaDevice(gpu_index);
       LOG(INFO) << "Bind FeatureMatcherWorker to GPU device " << gpu_index;
     }
-#else
-    THROW_CHECK_NOTNULL(opengl_context_);
-    THROW_CHECK(opengl_context_->MakeCurrent());
-#endif
   }
+#endif
 
-  if (matching_options_.type == FeatureMatcherType::SIFT) {
+  if (matching_options_.type == FeatureMatcherType::SIFT_BRUTEFORCE) {
     // TODO(jsch): This is a bit ugly, but currently cannot think of a better
     // way to inject the shared descriptor index cache.
     THROW_CHECK_NOTNULL(matching_options_.sift)->cpu_descriptor_index_cache =
@@ -127,37 +126,38 @@ void FeatureMatcherWorker::Run() {
           cache_->GetCamera(cache_->GetImage(data.image_id2).CameraId());
 
       if (matching_options_.guided_matching) {
-        matcher->MatchGuided(geometry_options_.ransac_options.max_error,
-                             {
-                                 data.image_id1,
-                                 static_cast<int>(camera1.width),
-                                 static_cast<int>(camera1.height),
-                                 cache_->GetKeypoints(data.image_id1),
-                                 cache_->GetDescriptors(data.image_id1),
-                             },
-                             {
-                                 data.image_id2,
-                                 static_cast<int>(camera2.width),
-                                 static_cast<int>(camera2.height),
-                                 cache_->GetKeypoints(data.image_id2),
-                                 cache_->GetDescriptors(data.image_id2),
-                             },
-                             &data.two_view_geometry);
+        matcher->MatchGuided(
+            geometry_options_.ransac_options.max_error,
+            {
+                data.image_id1,
+                &camera1,
+                cache_->GetKeypoints(data.image_id1),
+                cache_->GetDescriptors(data.image_id1),
+                cache_->FindImagePosePriorOrNull(data.image_id1),
+            },
+            {
+                data.image_id2,
+                &camera2,
+                cache_->GetKeypoints(data.image_id2),
+                cache_->GetDescriptors(data.image_id2),
+                cache_->FindImagePosePriorOrNull(data.image_id2),
+            },
+            &data.two_view_geometry);
       } else {
         matcher->Match(
             {
                 data.image_id1,
-                static_cast<int>(camera1.width),
-                static_cast<int>(camera1.height),
+                &camera1,
                 cache_->GetKeypoints(data.image_id1),
                 cache_->GetDescriptors(data.image_id1),
+                cache_->FindImagePosePriorOrNull(data.image_id1),
             },
             {
                 data.image_id2,
-                static_cast<int>(camera2.width),
-                static_cast<int>(camera2.height),
+                &camera2,
                 cache_->GetKeypoints(data.image_id2),
                 cache_->GetDescriptors(data.image_id2),
+                cache_->FindImagePosePriorOrNull(data.image_id2),
             },
             &data.matches);
       }
@@ -171,8 +171,8 @@ namespace {
 
 class VerifierWorker : public Thread {
  public:
-  typedef FeatureMatcherData Input;
-  typedef FeatureMatcherData Output;
+  using Input = FeatureMatcherData;
+  using Output = FeatureMatcherData;
 
   VerifierWorker(const TwoViewGeometryOptions& options,
                  std::shared_ptr<FeatureMatcherCache> cache,
@@ -216,20 +216,13 @@ class VerifierWorker : public Thread {
             FeatureKeypointsToPointsVector(*keypoints2);
 
         if (use_existing_relative_pose_ &&
-            data.two_view_geometry.config !=
-                TwoViewGeometry::ConfigurationType::DEGENERATE &&
-            data.two_view_geometry.config !=
-                TwoViewGeometry::ConfigurationType::MULTIPLE &&
-            data.two_view_geometry.config !=
-                TwoViewGeometry::ConfigurationType::WATERMARK &&
-            data.two_view_geometry.config !=
-                TwoViewGeometry::ConfigurationType::UNDEFINED) {
+            data.two_view_geometry.cam2_from_cam1.has_value()) {
           data.two_view_geometry = TwoViewGeometryFromKnownRelativePose(
               camera1,
               points1,
               camera2,
               points2,
-              data.two_view_geometry.cam2_from_cam1,
+              *data.two_view_geometry.cam2_from_cam1,
               data.matches,
               options_.min_num_inliers,
               options_.ransac_options.max_error);
@@ -263,6 +256,8 @@ FeatureMatcherController::FeatureMatcherController(
       is_setup_(false) {
   THROW_CHECK(matching_options_.Check());
   THROW_CHECK(geometry_options_.Check());
+  THROW_CHECK_EQ(geometry_options_.ransac_options.num_threads, 1)
+      << "Parallel RANSAC is not supported inside multi-threaded matching";
 
   const int num_threads = GetEffectiveNumThreads(matching_options_.num_threads);
   THROW_CHECK_GT(num_threads, 0);
@@ -288,27 +283,29 @@ FeatureMatcherController::FeatureMatcherController(
       skip_geometric_verification ? &output_queue_ : &verifier_queue_;
 
   if (matching_options_.use_gpu) {
-    auto matching_options_copy = matching_options_;
+    auto worker_matching_options = matching_options_;
     // The first matching is always without guided matching.
-    matching_options_copy.guided_matching = false;
+    worker_matching_options.guided_matching = false;
     matchers_.reserve(gpu_indices.size());
     for (const auto& gpu_index : gpu_indices) {
-      matching_options_copy.gpu_index = std::to_string(gpu_index);
+      worker_matching_options.gpu_index = std::to_string(gpu_index);
       matchers_.emplace_back(
-          std::make_unique<FeatureMatcherWorker>(matching_options_copy,
+          std::make_unique<FeatureMatcherWorker>(worker_matching_options,
                                                  geometry_options_,
                                                  cache_,
                                                  &matcher_queue_,
                                                  matcher_output_queue));
     }
   } else {
-    auto matching_options_copy = matching_options_;
+    auto worker_matching_options = matching_options_;
+    // Prevent nested threading.
+    worker_matching_options.num_threads = 1;
     // The first matching is always without guided matching.
-    matching_options_copy.guided_matching = false;
+    worker_matching_options.guided_matching = false;
     matchers_.reserve(num_threads);
     for (int i = 0; i < num_threads; ++i) {
       matchers_.emplace_back(
-          std::make_unique<FeatureMatcherWorker>(matching_options_copy,
+          std::make_unique<FeatureMatcherWorker>(worker_matching_options,
                                                  geometry_options_,
                                                  cache_,
                                                  &matcher_queue_,
@@ -325,22 +322,25 @@ FeatureMatcherController::FeatureMatcherController(
     }
 
     if (matching_options_.use_gpu) {
-      auto matching_options_copy = matching_options_;
+      auto worker_matching_options = matching_options_;
       guided_matchers_.reserve(gpu_indices.size());
       for (const auto& gpu_index : gpu_indices) {
-        matching_options_copy.gpu_index = std::to_string(gpu_index);
+        worker_matching_options.gpu_index = std::to_string(gpu_index);
         guided_matchers_.emplace_back(
-            std::make_unique<FeatureMatcherWorker>(matching_options_copy,
+            std::make_unique<FeatureMatcherWorker>(worker_matching_options,
                                                    geometry_options_,
                                                    cache_,
                                                    &guided_matcher_queue_,
                                                    &output_queue_));
       }
     } else {
+      auto worker_matching_options = matching_options_;
+      // Prevent nested threading.
+      worker_matching_options.num_threads = 1;
       guided_matchers_.reserve(num_threads);
       for (int i = 0; i < num_threads; ++i) {
         guided_matchers_.emplace_back(
-            std::make_unique<FeatureMatcherWorker>(matching_options_,
+            std::make_unique<FeatureMatcherWorker>(worker_matching_options,
                                                    geometry_options_,
                                                    cache_,
                                                    &guided_matcher_queue_,
