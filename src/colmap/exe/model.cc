@@ -41,11 +41,12 @@
 #include "colmap/scene/reconstruction_io.h"
 #include "colmap/sfm/observation_manager.h"
 #include "colmap/util/file.h"
+#include "colmap/util/hash_containers.h"
 #include "colmap/util/misc.h"
 #include "colmap/util/threading.h"
 
 #include <fstream>
-#include <unordered_map>
+#include <locale>
 
 namespace colmap {
 namespace {
@@ -77,6 +78,7 @@ void WriteBoundingBox(const std::filesystem::path& reconstruction_path,
     THROW_CHECK_FILE_OPEN(file, path);
 
     // Ensure that we don't lose any precision by storing in text.
+    file.imbue(std::locale::classic());
     file.precision(17);
     file << bbox.min().transpose() << '\n';
     file << bbox.max().transpose() << '\n';
@@ -88,6 +90,7 @@ void WriteBoundingBox(const std::filesystem::path& reconstruction_path,
     THROW_CHECK_FILE_OPEN(file, path);
 
     // Ensure that we don't lose any precision by storing in text.
+    file.imbue(std::locale::classic());
     file.precision(17);
     const Eigen::Vector3d center = (bbox.min() + bbox.max()) * 0.5;
     file << center.transpose() << "\n\n";
@@ -130,10 +133,11 @@ void ReadFileCameraLocations(const std::filesystem::path& ref_images_path,
                              std::vector<Eigen::Vector3d>* ref_locations) {
   for (const auto& line : ReadTextFileLines(ref_images_path)) {
     std::stringstream line_parser(line);
+    line_parser.imbue(std::locale::classic());
     std::string image_name;
     Eigen::Vector3d camera_position;
-    line_parser >> image_name >> camera_position[0] >> camera_position[1] >>
-        camera_position[2];
+    THROW_CHECK(line_parser >> image_name >> camera_position[0] >>
+                camera_position[1] >> camera_position[2]);
     ref_image_names->push_back(image_name);
     ref_locations->push_back(camera_position);
   }
@@ -150,7 +154,7 @@ void ReadDatabaseCameraLocations(const std::filesystem::path& database_path,
   auto database = Database::Open(database_path);
 
   // Index pose priors by their associated data ID.
-  std::unordered_map<data_t, PosePrior> pose_priors_by_data_id;
+  NodeHashMap<data_t, PosePrior> pose_priors_by_data_id;
   for (const auto& pose_prior : database->ReadAllPosePriors()) {
     pose_priors_by_data_id.emplace(pose_prior.corr_data_id, pose_prior);
   }
@@ -177,6 +181,7 @@ void WriteComparisonErrorsCSV(const std::filesystem::path& path,
   std::ofstream file(path, std::ios::trunc);
   THROW_CHECK_FILE_OPEN(file, path);
 
+  file.imbue(std::locale::classic());
   file.precision(17);
   file << "# Model comparison pose errors: one entry per common image\n";
   file << "# <rotation error (deg)>, <proj center error>\n";
@@ -282,7 +287,7 @@ int RunModelAligner(int argc, char** argv) {
   }
 
   StringToLower(&alignment_type);
-  const std::unordered_set<std::string> alignment_options{
+  const FlatHashSet<std::string> alignment_options{
       "plane", "ecef", "enu", "enu-plane", "enu-plane-unscaled", "custom"};
   if (alignment_options.count(alignment_type) == 0) {
     LOG(ERROR) << "Invalid `alignment_type` - supported values are "
@@ -958,6 +963,7 @@ int RunModelSplitter(int argc, char** argv) {
   if (split_type == "tiles") {
     std::ifstream file(split_params);
     THROW_CHECK_FILE_OPEN(file, split_params);
+    file.imbue(std::locale::classic());
 
     double x1, y1, z1, x2, y2, z2;
     std::string tile_key;

@@ -125,6 +125,37 @@ def download_imc2024(data_path: Path) -> None:
         shutil.move(scene, data_path / category_path)
 
 
+def download_imc2025(data_path: Path) -> None:
+    data_path.mkdir(parents=True, exist_ok=True)
+
+    pycolmap.logging.info("Downloading IMC2025")
+    subprocess.check_call(
+        [
+            "kaggle",
+            "competitions",
+            "download",
+            "-c",
+            "image-matching-challenge-2025",
+            "-p",
+            str(data_path),
+        ],
+    )
+
+    pycolmap.logging.info("Extracting IMC2025")
+    with zipfile.ZipFile(
+        data_path / "image-matching-challenge-2025.zip", mode="r"
+    ) as archive:
+        archive.extractall(path=data_path)
+
+    # Move all scenes to the "all" category sub-folder.
+    category_path = data_path / "train/all"
+    category_path.mkdir(parents=True, exist_ok=True)
+    for scene in (data_path / "train").iterdir():
+        if scene.name == "all":
+            continue
+        shutil.move(scene, category_path)
+
+
 # TODO: BlendedMVS+ and BlendedMVS++.
 def download_blended_mvs(data_path: Path) -> None:
     target_folder = data_path / "BlendedMVS"
@@ -140,15 +171,34 @@ def download_blended_mvs(data_path: Path) -> None:
             target_folder,
         )
 
+    pycolmap.logging.info("Merging BlendedMVS split archive")
+    combined_zip = target_folder / "BlendedMVS_combined.zip"
+    subprocess.check_call(
+        [
+            "zip",
+            "-q",
+            "-s",
+            "0",
+            str(target_folder / "BlendedMVS.zip"),
+            "--out",
+            str(combined_zip),
+        ]
+    )
+
     pycolmap.logging.info("Extracting BlendedMVS")
-    with zipfile.ZipFile(target_folder / "BlendedMVS.zip", mode="r") as archive:
-        archive.extractall(path=data_path)
+    try:
+        with zipfile.ZipFile(combined_zip, mode="r") as archive:
+            archive.extractall(path=data_path)
+    finally:
+        if combined_zip.exists():
+            combined_zip.unlink()
 
 
 DOWNLOADERS = {
     "eth3d": download_eth3d,
     "imc2023": download_imc2023,
     "imc2024": download_imc2024,
+    "imc2025": download_imc2025,
     "blended-mvs": download_blended_mvs,
 }
 

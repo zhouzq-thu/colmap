@@ -5,6 +5,7 @@ src/colmap/util/version.cc
 CMakeUserPresets.json
 .clangd
 compile_commands.json
+.claude/settings.local.json
 
 # Custom directories
 .idea/
@@ -18,6 +19,10 @@ data/
 benchmark/reconstruction/data/
 benchmark/reconstruction/runs/
 doc/_build
+doc/node_modules/
+doc/playwright-report/
+doc/_static/viewer/
+doc/test-results/
 vcpkg_installed/
 
 # Compiled Object files
