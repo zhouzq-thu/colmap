@@ -39,11 +39,15 @@
 #include "colmap/util/string.h"
 
 #if defined(COLMAP_GPU_ENABLED)
+#if defined(COLMAP_METAL_ENABLED)
+#include "thirdparty/SiftMetal/SiftMetal.h"
+#else
 #include "thirdparty/SiftGPU/SiftGPU.h"
 #if !defined(COLMAP_GUI_ENABLED)
 // GLEW symbols are already defined by Qt.
 #include <GL/glew.h>
 #endif  // COLMAP_GUI_ENABLED
+#endif  // COLMAP_METAL_ENABLED
 #endif  // COLMAP_GPU_ENABLED
 #include "colmap/util/eigen_alignment.h"
 
@@ -548,7 +552,7 @@ class CovariantSiftCPUFeatureExtractor : public FeatureExtractor {
   const FeatureExtractionOptions options_;
 };
 
-#if defined(COLMAP_GPU_ENABLED)
+#if defined(COLMAP_GPU_ENABLED) && !defined(COLMAP_METAL_ENABLED)
 // Mutexes that ensure that only one thread extracts/matches on the same GPU
 // at the same time, since SiftGPU internally uses static variables.
 static std::map<int, std::unique_ptr<std::mutex>> sift_gpu_mutexes_;
@@ -742,7 +746,96 @@ class SiftGPUFeatureExtractor : public FeatureExtractor {
   SiftGPU sift_gpu_;
   std::vector<SiftKeypoint> keypoints_buffer_;
 };
-#endif  // COLMAP_GPU_ENABLED
+#endif  // COLMAP_GPU_ENABLED && !COLMAP_METAL_ENABLED
+
+#if defined(COLMAP_METAL_ENABLED)
+class SiftMetalFeatureExtractor : public FeatureExtractor {
+ public:
+  explicit SiftMetalFeatureExtractor(const FeatureExtractionOptions& options)
+      : options_(options) {
+    THROW_CHECK(options_.Check());
+  }
+
+  static std::unique_ptr<FeatureExtractor> Create(
+      const FeatureExtractionOptions& options) {
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+
+    auto extractor = std::make_unique<SiftMetalFeatureExtractor>(options);
+
+    sift_metal::Options metal_opts;
+    metal_opts.num_octaves = options.sift->num_octaves;
+    metal_opts.scales_per_octave = options.sift->octave_resolution;
+    metal_opts.first_octave = options.sift->first_octave;
+    metal_opts.peak_threshold =
+        static_cast<float>(options.sift->peak_threshold);
+    metal_opts.edge_threshold =
+        static_cast<float>(options.sift->edge_threshold);
+    metal_opts.max_num_features = options.sift->max_num_features;
+    metal_opts.max_num_orientations = options.sift->max_num_orientations;
+    metal_opts.upright = options.sift->upright;
+
+    int max_dim = options.EffMaxImageSize();
+    if (!extractor->extractor_.Init(metal_opts, max_dim, max_dim)) {
+      LOG(ERROR) << "Failed to initialize Metal SIFT extractor";
+      return nullptr;
+    }
+
+    return extractor;
+  }
+
+  bool Extract(const Bitmap& bitmap,
+               FeatureKeypoints* keypoints,
+               FeatureDescriptors* descriptors) override {
+    THROW_CHECK(bitmap.IsGrey());
+    THROW_CHECK_NOTNULL(keypoints);
+    THROW_CHECK_NOTNULL(descriptors);
+
+    sift_metal::ExtractResult metal_result;
+    if (!extractor_.Extract(bitmap.RowMajorData().data(),
+                            bitmap.Width(), bitmap.Height(),
+                            &metal_result)) {
+      return false;
+    }
+
+    const size_t num_features = metal_result.keypoints.size();
+    keypoints->resize(num_features);
+    for (size_t i = 0; i < num_features; ++i) {
+      const auto& kp = metal_result.keypoints[i];
+      (*keypoints)[i] = FeatureKeypoint(kp.x, kp.y, kp.sigma, kp.orientation);
+    }
+
+    // Normalize and quantize descriptors.
+    FeatureDescriptorsFloatData descriptors_float(num_features,
+                                                   kSiftDescriptorDim);
+    for (size_t i = 0; i < num_features; ++i) {
+      for (int j = 0; j < kSiftDescriptorDim; ++j) {
+        descriptors_float(i, j) =
+            metal_result.descriptors[i * kSiftDescriptorDim + j];
+      }
+    }
+
+    if (options_.sift->normalization ==
+        SiftExtractionOptions::Normalization::L2) {
+      L2NormalizeFeatureDescriptors(&descriptors_float);
+    } else if (options_.sift->normalization ==
+               SiftExtractionOptions::Normalization::L1_ROOT) {
+      L1RootNormalizeFeatureDescriptors(&descriptors_float);
+    } else {
+      LOG(FATAL_THROW) << "Normalization type not supported";
+    }
+
+    descriptors->data = FeatureDescriptorsToUnsignedByte(descriptors_float);
+    descriptors->type = FeatureExtractorType::SIFT;
+
+    return true;
+  }
+
+ private:
+  const FeatureExtractionOptions options_;
+  sift_metal::SiftMetalExtractor extractor_;
+};
+#endif  // COLMAP_METAL_ENABLED
 
 }  // namespace
 
@@ -754,12 +847,15 @@ std::unique_ptr<FeatureExtractor> CreateSiftFeatureExtractor(
     LOG(INFO) << "Creating Covariant SIFT CPU feature extractor";
     return CovariantSiftCPUFeatureExtractor::Create(options);
   } else if (options.use_gpu) {
-#if defined(COLMAP_GPU_ENABLED)
+#if defined(COLMAP_METAL_ENABLED)
+    LOG(INFO) << "Creating SIFT Metal GPU feature extractor";
+    return SiftMetalFeatureExtractor::Create(options);
+#elif defined(COLMAP_GPU_ENABLED)
     LOG(INFO) << "Creating SIFT GPU feature extractor";
     return SiftGPUFeatureExtractor::Create(options);
 #else
     return nullptr;
-#endif  // COLMAP_GPU_ENABLED
+#endif
   } else {
     LOG(INFO) << "Creating SIFT CPU feature extractor";
     return SiftCPUFeatureExtractor::Create(options);
@@ -1312,7 +1408,7 @@ class SiftCPUFeatureMatcher : public FeatureMatcher {
   std::shared_ptr<FeatureDescriptorIndex> index2_;
 };
 
-#if defined(COLMAP_GPU_ENABLED)
+#if defined(COLMAP_GPU_ENABLED) && !defined(COLMAP_METAL_ENABLED)
 // Mutexes for OpenGL version to protect static variables in SiftGPU.
 // CUDA version doesn't need this as it has its own thread safety.
 static std::map<int, std::unique_ptr<std::mutex>> sift_opengl_mutexes_;
@@ -1629,7 +1725,7 @@ class SiftGPUFeatureMatcher : public FeatureMatcher {
   std::optional<Camera> prev_norm_camera1_;
   std::optional<Camera> prev_norm_camera2_;
 };
-#endif  // COLMAP_GPU_ENABLED
+#endif  // COLMAP_GPU_ENABLED && !COLMAP_METAL_ENABLED
 
 }  // namespace
 
@@ -1640,12 +1736,14 @@ std::unique_ptr<FeatureMatcher> CreateSiftFeatureMatcher(
     return CreateLightGlueONNXFeatureMatcher(options, options.sift->lightglue);
   } else if (options.type == FeatureMatcherType::SIFT_BRUTEFORCE) {
     if (options.use_gpu) {
-#ifdef COLMAP_GPU_ENABLED
+#if defined(COLMAP_GPU_ENABLED) && !defined(COLMAP_METAL_ENABLED)
       LOG(INFO) << "Creating SIFT GPU feature matcher";
       return SiftGPUFeatureMatcher::Create(options);
 #else
-      return nullptr;
-#endif  // COLMAP_GPU_ENABLED
+      // Metal builds use CPU matching (FAISS-based).
+      LOG(INFO) << "Creating SIFT CPU feature matcher (GPU matcher unavailable)";
+      return SiftCPUFeatureMatcher::Create(options);
+#endif
     } else {
       LOG(INFO) << "Creating SIFT CPU feature matcher";
       return SiftCPUFeatureMatcher::Create(options);

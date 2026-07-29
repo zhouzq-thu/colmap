@@ -13,7 +13,9 @@ else()
     message(STATUS "Disabling LSD support")
 endif()
 
-find_package(OpenMP REQUIRED COMPONENTS C CXX)
+if(OPENMP_ENABLED)
+    find_package(OpenMP REQUIRED COMPONENTS C CXX)
+endif()
 
 find_package(Boost ${COLMAP_FIND_TYPE} COMPONENTS
              graph
@@ -572,9 +574,19 @@ else()
     message(STATUS "Disabling OpenGL support")
 endif()
 
+if(METAL_ENABLED AND APPLE)
+    list(APPEND COLMAP_COMPILE_DEFINITIONS COLMAP_METAL_ENABLED)
+    message(STATUS "Enabling Metal GPU support")
+else()
+    set(METAL_ENABLED OFF)
+    if(APPLE AND NOT METAL_ENABLED)
+        message(STATUS "Disabling Metal support")
+    endif()
+endif()
+
 set(GPU_ENABLED OFF)
-if(OPENGL_ENABLED OR CUDA_ENABLED)
+if(OPENGL_ENABLED OR CUDA_ENABLED OR METAL_ENABLED)
     list(APPEND COLMAP_COMPILE_DEFINITIONS COLMAP_GPU_ENABLED)
-    message(STATUS "Enabling GPU support (OpenGL: ${OPENGL_ENABLED}, CUDA: ${CUDA_ENABLED})")
+    message(STATUS "Enabling GPU support (OpenGL: ${OPENGL_ENABLED}, CUDA: ${CUDA_ENABLED}, Metal: ${METAL_ENABLED})")
     set(GPU_ENABLED ON)
 endif()

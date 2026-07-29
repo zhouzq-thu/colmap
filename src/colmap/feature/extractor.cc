@@ -100,7 +100,7 @@ bool FeatureExtractionOptions::RequiresOpenGL() const {
           sift->force_covariant_extractor) {
         return false;
       }
-#ifdef COLMAP_CUDA_ENABLED
+#if defined(COLMAP_METAL_ENABLED) || defined(COLMAP_CUDA_ENABLED)
       return false;
 #else
       return use_gpu;

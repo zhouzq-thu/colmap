@@ -30,6 +30,44 @@ Download
   CUDA-enabled wheels are available at https://pypi.org/project/pycolmap-cuda12.
 * To **build from source**, please see https://colmap.github.io/install.html.
 
+Metal SIFT (macOS Apple Silicon)
+--------------------------------
+
+This fork adds **Metal-accelerated SIFT feature extraction** for macOS,
+replacing the CUDA/OpenGL GPU dependency. On Apple Silicon Macs, this provides
+GPU-accelerated SIFT without needing CUDA or a Qt/OpenGL context.
+
+**Benefits over CPU SIFT on M-series Macs:**
+
+| | Metal GPU | CPU (VLFeat) |
+|---|---|---|
+| Speed (53 images, 1920x1536) | 4.3s | 26.6s |
+| CPU time | 0.9s | 116s |
+| Peak RAM | 154 MB | 11.6 GB |
+
+**Build:**
+
+```bash
+mkdir build && cd build
+cmake .. \
+  -DMETAL_ENABLED=ON \
+  -DCUDA_ENABLED=OFF \
+  -DGUI_ENABLED=OFF \
+  -DOPENGL_ENABLED=OFF \
+  -DCMAKE_BUILD_TYPE=Release
+make -j$(sysctl -n hw.ncpu)
+```
+
+**Usage** is identical to standard COLMAP — Metal is used automatically when
+`--FeatureExtraction.use_gpu 1` (the default).
+
+The Metal SIFT implementation is based on
+[SIFTMetal](https://github.com/lukevanin/SIFTMetal) by Luke Van In, with the
+Swift host code rewritten in Objective-C++ for direct CMake integration. The
+Metal compute shaders handle the full SIFT pipeline: Gaussian scale-space,
+Difference-of-Gaussians, extrema detection, keypoint interpolation, orientation
+assignment, and descriptor extraction.
+
 Getting Started
 ---------------
 
